@@ -1,0 +1,612 @@
+import React, { useRef, useState, useCallback, useEffect } from 'react';
+import {
+  Modal, View, Text, TextInput, TouchableOpacity,
+  StyleSheet, KeyboardAvoidingView, Platform, TouchableWithoutFeedback,
+  ScrollView, NativeSyntheticEvent, NativeScrollEvent,
+} from 'react-native';
+import { ChevronDown, RefreshCw, Clock, Calendar, Link } from 'lucide-react-native';
+import { DEFAULT_CATEGORIES, Category } from '../constants/categories';
+import InlineCalendar from './InlineCalendar';
+
+const INK    = '#2D2D2D';
+const BG     = '#FEFEFE';
+const MUTED  = '#8A8480';
+const BORDER = 1.354;
+const DASH   = 0.677;
+const RADIUS = 4;
+const MARGIN = 18;
+
+const HOURS   = ['12','01','02','03','04','05','06','07','08','09','10','11'];
+const MINUTES = ['00','05','10','15','20','25','30','35','40','45','50','55'];
+const PERIODS = ['AM','PM'];
+const ITEM_H  = 44;
+const WEEK_DAYS = ['Mo','Tu','We','Th','Fr','Sa','Su'];
+
+type RepeatType = 'daily' | 'weekly' | 'monthly';
+type Panel = 'main' | 'category' | 'time' | 'date';
+
+export interface NewTask {
+  title:       string;
+  categoryId:  string;
+  date:        string; // "YYYY-MM-DD"
+  startTime:   string;
+  duration:    string;
+  isRecurring: boolean;
+}
+
+function toISODate(d: Date): string {
+  const y = d.getFullYear();
+  const m = (d.getMonth() + 1).toString().padStart(2, '0');
+  const day = d.getDate().toString().padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function dateLabel(d: Date): string {
+  const today = new Date();
+  const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
+  if (toISODate(d) === toISODate(today)) return 'Today';
+  if (toISODate(d) === toISODate(tomorrow)) return 'Tomorrow';
+  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+}
+
+interface CategoryOption {
+  id:    string;
+  name:  string;
+  icon:  string;
+  color?: string | null;
+}
+
+export interface EditableTask {
+  id:               string;
+  title:            string;
+  categoryId:       string | null;
+  date:             string; // "YYYY-MM-DD"
+  scheduledTime?:   string; // "HH:MM" or "HH:MM:SS", 24-hour
+  durationMinutes?: number;
+}
+
+interface Props {
+  visible:      boolean;
+  onClose:      () => void;
+  onAdd?:       (task: NewTask) => void;
+  onSave?:      (id: string, task: NewTask) => void;
+  categories?:  CategoryOption[];
+  editingTask?: EditableTask | null;
+  initialDate?: string; // "YYYY-MM-DD", defaults to today when adding
+}
+
+// ─── Scroll column for time picker ───────────────────────────────────────────
+interface ColProps {
+  items:    string[];
+  selected: string;
+  onSettle: (val: string) => void;
+}
+
+function ScrollCol({ items, selected, onSettle }: ColProps) {
+  const ref = useRef<ScrollView>(null);
+  const idx = items.indexOf(selected);
+
+  const handleMomentum = useCallback(
+    (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+      const raw     = Math.round(e.nativeEvent.contentOffset.y / ITEM_H);
+      const clamped = Math.max(0, Math.min(raw, items.length - 1));
+      onSettle(items[clamped]);
+    },
+    [items, onSettle],
+  );
+
+  return (
+    <ScrollView
+      ref={ref}
+      style={col.wrap}
+      contentOffset={{ x: 0, y: Math.max(0, idx) * ITEM_H }}
+      snapToInterval={ITEM_H}
+      decelerationRate="fast"
+      showsVerticalScrollIndicator={false}
+      onMomentumScrollEnd={handleMomentum}
+    >
+      <View style={{ height: ITEM_H }} />
+      {items.map((item, i) => (
+        <View key={i} style={col.item}>
+          <Text style={[col.txt, item === selected && col.txtSel]}>{item}</Text>
+        </View>
+      ))}
+      <View style={{ height: ITEM_H }} />
+    </ScrollView>
+  );
+}
+
+const col = StyleSheet.create({
+  wrap:   { height: ITEM_H * 3, flex: 1 },
+  item:   { height: ITEM_H, alignItems: 'center', justifyContent: 'center' },
+  txt:    { fontFamily: 'VT323', fontSize: 28, color: MUTED, lineHeight: 32 },
+  txtSel: { color: INK, fontSize: 32 },
+});
+
+// ─── Inline repeat section ────────────────────────────────────────────────────
+interface RepeatProps {
+  repeatType:    RepeatType;
+  onRepeatType:  (t: RepeatType) => void;
+  interval:      string;
+  onInterval:    (v: string) => void;
+  selectedDays:  Set<number>;
+  onToggleDay:   (d: number) => void;
+}
+
+function RepeatSection({ repeatType, onRepeatType, interval, onInterval, selectedDays, onToggleDay }: RepeatProps) {
+  return (
+    <View style={r.wrap}>
+      {/* DAILY / WEEKLY / MONTHLY tab bar */}
+      <View style={r.tabs}>
+        {(['daily','weekly','monthly'] as RepeatType[]).map((t, i) => (
+          <TouchableOpacity
+            key={t}
+            style={[r.tab, i > 0 && r.tabDiv, t === repeatType && r.tabOn]}
+            onPress={() => onRepeatType(t)}
+            activeOpacity={0.8}
+          >
+            <Text style={[r.tabTxt, t === repeatType && r.tabTxtOn]}>
+              {t.toUpperCase()}
+            </Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+
+      {/* DAILY sub-options */}
+      {repeatType === 'daily' && (
+        <View style={r.subRow}>
+          <Text style={r.subLabel}>REPEAT EVERY</Text>
+          <TextInput
+            style={r.intervalInput}
+            value={interval}
+            onChangeText={onInterval}
+            keyboardType="numeric"
+            maxLength={2}
+          />
+          <Text style={r.subLabel}>DAY(S)</Text>
+        </View>
+      )}
+
+      {/* WEEKLY sub-options */}
+      {repeatType === 'weekly' && (
+        <View style={r.subCol}>
+          <Text style={r.subLabel}>REPEAT ON</Text>
+          <View style={r.dayGrid}>
+            {WEEK_DAYS.map((d, i) => (
+              <TouchableOpacity
+                key={d}
+                style={[r.dayCell, i > 0 && r.dayCellDiv, selectedDays.has(i) && r.dayCellOn]}
+                onPress={() => onToggleDay(i)}
+                activeOpacity={0.8}
+              >
+                <Text style={[r.dayTxt, selectedDays.has(i) && r.dayTxtOn]}>{d}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </View>
+      )}
+
+      {/* MONTHLY sub-options */}
+      {repeatType === 'monthly' && (
+        <View style={r.subRow}>
+          <Text style={r.subLabel}>REPEAT ON DAY</Text>
+          <TextInput
+            style={r.intervalInput}
+            value={interval}
+            onChangeText={onInterval}
+            keyboardType="numeric"
+            maxLength={2}
+          />
+          <Text style={r.subLabel}>OF EACH MONTH</Text>
+        </View>
+      )}
+    </View>
+  );
+}
+
+const r = StyleSheet.create({
+  wrap: {
+    borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS,
+    overflow: 'hidden',
+  },
+  tabs: {
+    flexDirection: 'row',
+    borderBottomWidth: BORDER, borderBottomColor: INK,
+  },
+  tab:      { flex: 1, paddingVertical: 10, alignItems: 'center', backgroundColor: BG },
+  tabDiv:   { borderLeftWidth: BORDER, borderLeftColor: INK },
+  tabOn:    { backgroundColor: INK },
+  tabTxt:   { fontFamily: 'PressStart2P', fontSize: 6, color: INK, lineHeight: 9 },
+  tabTxtOn: { color: BG },
+
+  subRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 8,
+    paddingHorizontal: 12, paddingVertical: 12,
+  },
+  subCol: { paddingHorizontal: 12, paddingVertical: 12, gap: 8 },
+  subLabel: { fontFamily: 'PressStart2P', fontSize: 5, color: MUTED, lineHeight: 8 },
+  intervalInput: {
+    width: 40, height: 32, borderWidth: BORDER, borderColor: INK, borderRadius: 2,
+    textAlign: 'center', fontFamily: 'VT323', fontSize: 18, color: INK,
+  },
+
+  dayGrid:    { flexDirection: 'row', borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, overflow: 'hidden' },
+  dayCell:    { flex: 1, paddingVertical: 8, alignItems: 'center', backgroundColor: BG },
+  dayCellDiv: { borderLeftWidth: BORDER, borderLeftColor: INK },
+  dayCellOn:  { backgroundColor: INK },
+  dayTxt:     { fontFamily: 'PressStart2P', fontSize: 5, color: INK, lineHeight: 8 },
+  dayTxtOn:   { color: BG },
+});
+
+// ─── Main component ───────────────────────────────────────────────────────────
+export default function AddTaskModal({ visible, onClose, onAdd, onSave, categories, editingTask, initialDate }: Props) {
+  const options = categories && categories.length > 0 ? categories : DEFAULT_CATEGORIES;
+
+  const [title,       setTitle]       = useState('');
+  const [categoryId,  setCategoryId]  = useState(options[0]?.id ?? '');
+  const [date,        setDate]        = useState(new Date());
+  const [duration,    setDuration]    = useState('');
+  const [isRecurring, setIsRecurring] = useState(false);
+  const [repeatType,  setRepeatType]  = useState<RepeatType>('daily');
+  const [interval,    setInterval]    = useState('1');
+  const [selectedDays, setSelectedDays] = useState<Set<number>>(new Set());
+  const [panel,       setPanel]       = useState<Panel>('main');
+
+  // Time picker state
+  const [hour,    setHour]    = useState('08');
+  const [minute,  setMinute]  = useState('00');
+  const [period,  setPeriod]  = useState<'AM' | 'PM'>('AM');
+  const [timeSet, setTimeSet] = useState(false);
+
+  const selectedCat    = options.find(c => c.id === categoryId) ?? options[0];
+  const startTimeLabel = timeSet ? `${hour}:${minute} ${period}` : '--:-- --';
+
+  useEffect(() => {
+    if (!options.some(c => c.id === categoryId)) setCategoryId(options[0]?.id ?? '');
+  }, [options]);
+
+  // Only populate fields the moment the modal transitions to visible — not on
+  // every re-render — otherwise a parent re-render (e.g. a clock tick) would
+  // wipe out whatever the user is actively typing.
+  const wasVisibleRef = useRef(false);
+  useEffect(() => {
+    const justOpened = visible && !wasVisibleRef.current;
+    wasVisibleRef.current = visible;
+    if (!justOpened) return;
+
+    if (editingTask) {
+      setTitle(editingTask.title);
+      setCategoryId(editingTask.categoryId ?? options[0]?.id ?? '');
+      setDuration(editingTask.durationMinutes ? String(editingTask.durationMinutes) : '');
+      setDate(new Date(`${editingTask.date}T00:00:00`));
+      if (editingTask.scheduledTime) {
+        const [hh, mm] = editingTask.scheduledTime.split(':');
+        const h24 = parseInt(hh, 10);
+        const ap: 'AM' | 'PM' = h24 >= 12 ? 'PM' : 'AM';
+        const h12 = h24 % 12 === 0 ? 12 : h24 % 12;
+        setHour(h12.toString().padStart(2, '0'));
+        setMinute(mm);
+        setPeriod(ap);
+        setTimeSet(true);
+      } else {
+        setTimeSet(false);
+      }
+    } else {
+      setDate(initialDate ? new Date(`${initialDate}T00:00:00`) : new Date());
+    }
+  }, [visible]);
+
+  const toggleDay = (d: number) => {
+    setSelectedDays(prev => {
+      const next = new Set(prev);
+      next.has(d) ? next.delete(d) : next.add(d);
+      return next;
+    });
+  };
+
+  const reset = () => {
+    setTitle(''); setDuration(''); setIsRecurring(false);
+    setRepeatType('daily'); setInterval('1'); setSelectedDays(new Set());
+    setHour('08'); setMinute('00'); setPeriod('AM'); setTimeSet(false);
+    setPanel('main');
+  };
+
+  const handleClose = () => { reset(); onClose(); };
+
+  const handleAdd = () => {
+    if (!title.trim()) return;
+    const payload: NewTask = {
+      title:       title.trim(),
+      categoryId,
+      date:        toISODate(date),
+      startTime:   timeSet ? `${hour}:${minute} ${period}` : '',
+      duration,
+      isRecurring,
+    };
+    if (editingTask) {
+      onSave?.(editingTask.id, payload);
+    } else {
+      onAdd?.(payload);
+    }
+    reset(); onClose();
+  };
+
+  const confirmTime = () => { setTimeSet(true);  setPanel('main'); };
+  const clearTime   = () => { setTimeSet(false); setPanel('main'); };
+
+  return (
+    <Modal visible={visible} transparent animationType="slide" statusBarTranslucent>
+      <TouchableWithoutFeedback onPress={panel === 'main' ? handleClose : undefined}>
+        <View style={StyleSheet.absoluteFill} />
+      </TouchableWithoutFeedback>
+      <View style={s.backdrop} pointerEvents="none" />
+
+      <KeyboardAvoidingView style={s.kav} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        <View style={s.sheet}>
+
+          {/* ── MAIN PANEL ── */}
+          {panel === 'main' && (
+            <>
+              <Text style={s.header}>{editingTask ? 'EDIT TASK' : 'ADD TASK'}</Text>
+
+              {/* Category dropdown */}
+              <TouchableOpacity style={s.catDropdown} onPress={() => setPanel('category')} activeOpacity={0.8}>
+                <Text style={s.catText}>{selectedCat?.name.toUpperCase() ?? 'NO CATEGORY'}</Text>
+                <ChevronDown size={12} color={INK} strokeWidth={2} />
+              </TouchableOpacity>
+
+              {/* Name + repeat toggle */}
+              <View style={s.inputRow}>
+                <TextInput
+                  style={s.textInput}
+                  placeholder="What needs to happen..."
+                  placeholderTextColor={MUTED}
+                  value={title}
+                  onChangeText={setTitle}
+                  returnKeyType="done"
+                  onSubmitEditing={handleAdd}
+                  autoFocus
+                />
+                {!editingTask && (
+                  <TouchableOpacity
+                    style={[s.iconBtn, isRecurring && s.iconBtnActive]}
+                    onPress={() => setIsRecurring(v => !v)}
+                    activeOpacity={0.8}
+                  >
+                    <RefreshCw size={14} color={isRecurring ? BG : INK} strokeWidth={1.5} />
+                  </TouchableOpacity>
+                )}
+              </View>
+
+              {/* Inline repeat section */}
+              {!editingTask && isRecurring && (
+                <RepeatSection
+                  repeatType={repeatType}
+                  onRepeatType={setRepeatType}
+                  interval={interval}
+                  onInterval={setInterval}
+                  selectedDays={selectedDays}
+                  onToggleDay={toggleDay}
+                />
+              )}
+
+              {/* DATE */}
+              <TouchableOpacity style={s.dateField} onPress={() => setPanel('date')} activeOpacity={0.8}>
+                <Text style={s.dateFieldTxt}>{dateLabel(date)}</Text>
+                <Calendar size={13} color={MUTED} strokeWidth={1.5} />
+              </TouchableOpacity>
+
+              {/* START TIME + DURATION */}
+              <View style={s.timeRow}>
+                <TouchableOpacity style={s.startTimeField} onPress={() => setPanel('time')} activeOpacity={0.8}>
+                  <Text style={[s.startTimeTxt, !timeSet && s.startTimePlaceholder]}>
+                    {startTimeLabel}
+                  </Text>
+                  <Clock size={13} color={MUTED} strokeWidth={1.5} />
+                </TouchableOpacity>
+                <View style={s.durationWrap}>
+                  <Text style={s.fieldLabel}>DURATION</Text>
+                  <TextInput
+                    style={s.durationInput}
+                    placeholder="45"
+                    placeholderTextColor={MUTED}
+                    keyboardType="numeric"
+                    value={duration}
+                    onChangeText={setDuration}
+                  />
+                </View>
+              </View>
+
+              {/* SAVE/ADD + CANCEL */}
+              <View style={s.btnRow}>
+                <TouchableOpacity style={s.addBtn} onPress={handleAdd} activeOpacity={0.8}>
+                  <Text style={s.addBtnTxt}>{editingTask ? 'SAVE' : 'ADD'}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={s.cancelBtn} onPress={handleClose} activeOpacity={0.7}>
+                  <Text style={s.cancelBtnTxt}>CANCEL</Text>
+                </TouchableOpacity>
+              </View>
+
+              {!editingTask && (
+                <>
+                  {/* — OR — */}
+                  <View style={s.orRow}>
+                    <View style={s.orLine} />
+                    <Text style={s.orTxt}>— OR —</Text>
+                    <View style={s.orLine} />
+                  </View>
+
+                  {/* Upload */}
+                  <TouchableOpacity style={s.uploadBtn} activeOpacity={0.7}>
+                    <Link size={13} color={INK} strokeWidth={1.5} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={s.uploadTitle}>Upload file to extract tasks</Text>
+                      <Text style={s.uploadSub}>PDF, JPG, PNG — workout plans, schedules, docs</Text>
+                    </View>
+                  </TouchableOpacity>
+                </>
+              )}
+            </>
+          )}
+
+          {/* ── CATEGORY PANEL ── */}
+          {panel === 'category' && (
+            <>
+              <View style={s.panelHeader}>
+                <Text style={s.header}>CATEGORY</Text>
+                <TouchableOpacity onPress={() => setPanel('main')} activeOpacity={0.7}>
+                  <Text style={s.backTxt}>← BACK</Text>
+                </TouchableOpacity>
+              </View>
+              {options.map(cat => (
+                <TouchableOpacity
+                  key={cat.id}
+                  style={[s.catOption, cat.id === categoryId && s.catOptionActive]}
+                  onPress={() => { setCategoryId(cat.id); setPanel('main'); }}
+                  activeOpacity={0.8}
+                >
+                  <Text style={[s.catOptionTxt, cat.id === categoryId && s.catOptionTxtActive]}>
+                    {cat.name.toUpperCase()}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </>
+          )}
+
+          {/* ── TIME PICKER PANEL ── */}
+          {panel === 'time' && (
+            <>
+              <View style={s.panelHeader}>
+                <Text style={s.header}>START TIME</Text>
+                <TouchableOpacity onPress={() => setPanel('main')} activeOpacity={0.7}>
+                  <Text style={s.backTxt}>← BACK</Text>
+                </TouchableOpacity>
+              </View>
+
+              <View style={s.pickerWrap}>
+                <View style={s.selHighlight} pointerEvents="none" />
+                <ScrollCol items={HOURS}   selected={hour}   onSettle={setHour} />
+                <Text style={s.colon}>:</Text>
+                <ScrollCol items={MINUTES} selected={minute} onSettle={setMinute} />
+                <ScrollCol items={PERIODS} selected={period} onSettle={v => setPeriod(v as 'AM' | 'PM')} />
+              </View>
+
+              <View style={s.btnRow}>
+                <TouchableOpacity style={s.addBtn} onPress={confirmTime} activeOpacity={0.8}>
+                  <Text style={s.addBtnTxt}>SET TIME</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={s.cancelBtn} onPress={clearTime} activeOpacity={0.7}>
+                  <Text style={s.cancelBtnTxt}>CLEAR</Text>
+                </TouchableOpacity>
+              </View>
+            </>
+          )}
+
+          {/* ── DATE PICKER PANEL ── */}
+          {panel === 'date' && (
+            <>
+              <View style={s.panelHeader}>
+                <Text style={s.header}>DATE</Text>
+                <TouchableOpacity onPress={() => setPanel('main')} activeOpacity={0.7}>
+                  <Text style={s.backTxt}>← BACK</Text>
+                </TouchableOpacity>
+              </View>
+              <InlineCalendar
+                selectedDate={date}
+                onSelectDate={d => { setDate(d); setPanel('main'); }}
+              />
+            </>
+          )}
+
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
+  );
+}
+
+const s = StyleSheet.create({
+  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.35)' },
+  kav:   { flex: 1, justifyContent: 'flex-end' },
+  sheet: {
+    backgroundColor: BG,
+    borderTopWidth: BORDER, borderLeftWidth: BORDER, borderRightWidth: BORDER, borderColor: INK,
+    borderTopLeftRadius: 6, borderTopRightRadius: 6,
+    paddingHorizontal: MARGIN, paddingTop: 20, paddingBottom: 36,
+    gap: 14,
+  },
+  header: { fontFamily: 'PressStart2P', fontSize: 8, color: INK, lineHeight: 12 },
+
+  catDropdown: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS,
+    paddingHorizontal: 14, paddingVertical: 13,
+  },
+  catText: { fontFamily: 'VT323', fontSize: 18, color: INK, lineHeight: 20 },
+
+  inputRow:  { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  textInput: {
+    flex: 1, height: 40, borderWidth: BORDER, borderColor: INK, borderRadius: 2,
+    paddingHorizontal: 10, fontFamily: 'VT323', fontSize: 16, color: INK,
+  },
+  iconBtn:       { width: 40, height: 40, borderWidth: BORDER, borderColor: INK, borderRadius: 2, alignItems: 'center', justifyContent: 'center' },
+  iconBtnActive: { backgroundColor: INK },
+
+  dateField: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    borderWidth: BORDER, borderColor: INK, borderRadius: 2,
+    paddingHorizontal: 10, height: 44,
+  },
+  dateFieldTxt: { fontFamily: 'VT323', fontSize: 18, color: INK, lineHeight: 22 },
+
+  timeRow:     { flexDirection: 'row', gap: 10, alignItems: 'flex-end' },
+  startTimeField: {
+    flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    borderWidth: BORDER, borderColor: INK, borderRadius: 2,
+    paddingHorizontal: 10, height: 44,
+  },
+  startTimeTxt:         { fontFamily: 'VT323', fontSize: 18, color: INK, lineHeight: 22 },
+  startTimePlaceholder: { color: MUTED },
+  durationWrap:  { width: 80, gap: 5 },
+  fieldLabel:    { fontFamily: 'PressStart2P', fontSize: 5, color: MUTED, lineHeight: 8 },
+  durationInput: {
+    height: 44, borderWidth: BORDER, borderColor: INK, borderRadius: 2,
+    paddingHorizontal: 10, fontFamily: 'VT323', fontSize: 18, color: INK, textAlign: 'center',
+  },
+
+  btnRow:       { flexDirection: 'row', gap: 10 },
+  addBtn:       { flex: 1, backgroundColor: INK, borderRadius: RADIUS, paddingVertical: 12, alignItems: 'center' },
+  addBtnTxt:    { fontFamily: 'PressStart2P', fontSize: 7, color: BG, lineHeight: 11 },
+  cancelBtn:    { flex: 1, borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, paddingVertical: 12, alignItems: 'center' },
+  cancelBtnTxt: { fontFamily: 'PressStart2P', fontSize: 7, color: INK, lineHeight: 11 },
+
+  orRow:  { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  orLine: { flex: 1, height: DASH, backgroundColor: MUTED },
+  orTxt:  { fontFamily: 'PressStart2P', fontSize: 5, color: MUTED, lineHeight: 8 },
+
+  uploadBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: 12,
+    borderWidth: DASH, borderStyle: 'dashed', borderColor: INK,
+    borderRadius: RADIUS, paddingHorizontal: 14, paddingVertical: 14,
+  },
+  uploadTitle: { fontFamily: 'VT323', fontSize: 16, color: INK, lineHeight: 18 },
+  uploadSub:   { fontFamily: 'PressStart2P', fontSize: 5, color: MUTED, lineHeight: 8, marginTop: 2 },
+
+  panelHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  backTxt:     { fontFamily: 'PressStart2P', fontSize: 6, color: MUTED, lineHeight: 9 },
+
+  catOption:        { borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, paddingHorizontal: 14, paddingVertical: 13 },
+  catOptionActive:  { backgroundColor: INK },
+  catOptionTxt:     { fontFamily: 'VT323', fontSize: 18, color: INK, lineHeight: 20 },
+  catOptionTxtActive: { color: BG },
+
+  pickerWrap: {
+    flexDirection: 'row', alignItems: 'center',
+    borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS,
+    overflow: 'hidden', paddingHorizontal: 8,
+  },
+  selHighlight: {
+    position: 'absolute', top: ITEM_H, left: 0, right: 0, height: ITEM_H,
+    borderTopWidth: BORDER, borderBottomWidth: BORDER, borderColor: INK,
+  },
+  colon: { fontFamily: 'VT323', fontSize: 28, color: INK, lineHeight: 32, paddingHorizontal: 4, paddingBottom: 4 },
+});
