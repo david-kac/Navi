@@ -383,3 +383,34 @@ On first launch, a hidden settings screen (accessible via long-press on Dot) pro
 | No gradients | ✓ |
 | No shadows | ✓ |
 | Dot sprite | 60×60px, top-left, only color element |
+
+---
+
+## Session Log
+
+### 2026-06-19 — Dead code cleanup + EAS build setup
+
+**Current app state (as of this session):**
+- Stack is actually Expo SDK 54 (not 56 as earlier docs/duplicate files claimed) with a real Supabase backend (auth, tasks, categories, recurring rules) — no longer local SQLite.
+- `app/index.tsx` carries Day/Week/Categories views as in-file tab states (not separate routes as originally spec'd).
+- `app/dot-chat.tsx` has a working Claude tool-use loop (add_task/update_task/review_schedule) with conflict detection wired in via `lib/conflicts.ts`.
+- `lib/ai.ts` and `lib/recurring.ts` are real and complete; `lib/conflicts.ts` covers overlap/commute/Thursday-date-night protection.
+- **Still missing:** no `VoiceModal` component exists at all (voice input is unbuilt despite `expo-speech` being installed); no dedicated Week/Categories/End-of-Day/Calendar screens (all inline); no "All Tasks Complete" celebration screen (just a small `RelaxRow`); `DotCharacter` only has `happy`/`sleeping` sprites — `thinking`/`excited` silently fall back to `happy`; no marathon-training-plan-specific auto-insert logic (recurring engine is generic only).
+
+**Completed this session:**
+1. Diagnosed and deleted dead code: `lib/db.ts` (leftover local SQLite schema, fully superseded by Supabase) and `lib/userContext.ts` (its only consumer, itself unused anywhere in the app).
+2. Uninstalled the now-unused `expo-sqlite` dependency from `package.json`/`package-lock.json`.
+3. Diagnosed and deleted three stale duplicate snapshot files cluttering the repo root: `AGENTS 2.md`, `CLAUDE 2.md`, `package-lock 2.json` — leftover copies from an earlier SDK-56-vs-54 migration point, not referenced anywhere.
+4. Committed and pushed pending in-progress work that had been sitting uncommitted:
+   - `eas.json` + `.npmrc` — new EAS build configuration (project ID `465326ec-efd7-4a8d-a00c-ae0628dbd0ef`, owner `dkacinski`).
+   - `app.json` — added `ITSAppUsesNonExemptEncryption: false` to iOS `infoPlist`, added `extra.eas.projectId` and `extra.router`, added `owner` field.
+   - `assets/adaptive-icon.png` / `assets/icon.png` — updated icon assets.
+   - `lib/ai.ts` — fixed a bug in `runPlannerTurn`: tool calls were being dropped when Claude's response was cut off by `max_tokens` before reaching a `tool_use` stop reason, leaving dangling unresolved `tool_use` blocks that broke every subsequent request with a 400. Now resolves any `tool_use` blocks present regardless of `stop_reason`, and raised the token budget for that call from 600 to 1500.
+   - Pushed as commit `1a3d0f3` ("EAS build setup and cleanup") to `origin/master`.
+
+**Unresolved / open items for next session:**
+- Voice input (`VoiceModal`, `expo-speech` wiring) — biggest gap versus the original spec, not started.
+- No separate route files for Week/Categories/End-of-Day/Calendar — currently fine functionally, but worth deciding whether to keep as in-file tabs or split into real routes per the original architecture doc.
+- `DotCharacter` missing `thinking`/`excited` sprite assets.
+- No marathon-training-plan-specific recurring logic or Supabase table (only existed in the now-deleted `lib/db.ts`).
+- EAS build config (`eas.json`) was just added but not yet tested with an actual `eas build` run.
