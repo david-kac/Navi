@@ -15,7 +15,10 @@
     },
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "com.davidkacinski.dot"
+      "bundleIdentifier": "com.davidkacinski.dot",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -40,6 +43,13 @@
           ]
         }
       ]
-    ]
+    ],
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "465326ec-efd7-4a8d-a00c-ae0628dbd0ef"
+      }
+    },
+    "owner": "dkacinski"
   }
 }

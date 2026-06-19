@@ -299,16 +299,19 @@ export async function runPlannerTurn(
   let replyText = '';
 
   for (let i = 0; i < 5; i++) {
-    const response = await callClaudeRaw(systemPrompt, messages, 600);
+    const response = await callClaudeRaw(systemPrompt, messages, 1500);
     messages = [...messages, { role: 'assistant', content: response.content }];
 
     const textBlocks = response.content.filter(b => b.type === 'text') as { type: 'text'; text: string }[];
     replyText = textBlocks.map(b => b.text).join('\n').trim();
 
-    if (response.stop_reason !== 'tool_use') break;
-
     const toolUses = response.content.filter(b => b.type === 'tool_use') as
       { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }[];
+
+    // Resolve any tool_use blocks present, regardless of stop_reason — Claude can be
+    // cut off by max_tokens after emitting complete tool calls, and an unresolved
+    // tool_use left dangling in history breaks every subsequent request with a 400.
+    if (toolUses.length === 0) break;
 
     const toolResults: AnthropicContentBlock[] = [];
     for (const call of toolUses) {

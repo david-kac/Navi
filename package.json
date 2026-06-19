@@ -21,7 +21,6 @@
     "expo-secure-store": "~15.0.8",
     "expo-speech": "~14.0.8",
     "expo-splash-screen": "~31.0.13",
-    "expo-sqlite": "~16.0.10",
     "expo-status-bar": "~3.0.9",
     "lucide-react-native": "^1.20.0",
     "react": "19.1.0",
