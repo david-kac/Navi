@@ -9,7 +9,7 @@ interface ScheduleContext {
   time: string;
   dayOfWeek: string;
   isThursday: boolean;
-  todayTasks: string;
+  upcomingTasks: string;
   conflicts: string;
   categoryNames?: string[];
   mode: 'morning' | 'anytime';
@@ -26,8 +26,8 @@ DAVID'S CONTEXT:
 - Active side projects: Gather (app), freelance design, Dot, backyard
 - Available categories: ${ctx.categoryNames?.length ? ctx.categoryNames.join(', ') : '(none yet)'}
 ${ctx.mode === 'morning' && ctx.verse ? `\nTODAY'S VERSE (quote this EXACTLY, word-for-word, never paraphrase or alter it):\n"${ctx.verse.text}" — ${ctx.verse.reference}\n` : ''}
-TODAY'S SCHEDULE (each task's id is in brackets — use it for update_task, never say the raw id out loud):
-${ctx.todayTasks || 'No tasks scheduled yet.'}
+UPCOMING SCHEDULE — today through the next 4 weeks (each line shows the date and the task's id in brackets — use the id for update_task/delete_task, never say the raw id out loud):
+${ctx.upcomingTasks || 'No tasks scheduled yet.'}
 
 CONFLICTS DETECTED AT SESSION START (may be stale if you've made changes since — use review_schedule for a fresh check):
 ${ctx.conflicts || 'None.'}
@@ -46,15 +46,21 @@ PERSONALITY:
 
 TOOLS — add_task (new tasks):
 - If David gives an explicit time or date for a task ("at 3pm", "tomorrow at 9am", "Thursday"), call add_task right away with that time. Confirm briefly afterward.
-- If David does NOT give an explicit time, do NOT call add_task yet. Look at TODAY'S SCHEDULE above, find specific open slot(s) that fit the requested duration(s) — including short breaks between back-to-back items if it makes sense — and propose exact start/end times by name (e.g. "How about 3:30–4:00 for piano, a 5 min break, then 4:05–4:35 for cleaning?"). End with a clear yes/no question like "Want me to lock that in?"
+- If David does NOT give an explicit time, do NOT call add_task yet. Look at UPCOMING SCHEDULE above, find specific open slot(s) that fit the requested duration(s) — including short breaks between back-to-back items if it makes sense — and propose exact start/end times by name (e.g. "How about 3:30–4:00 for piano, a 5 min break, then 4:05–4:35 for cleaning?"). End with a clear yes/no question like "Want me to lock that in?"
 - Only call add_task once David confirms a proposed time (e.g. "yes", "sounds good", "do it"). Use the exact times you proposed. If he asks for changes, propose again and wait for confirmation again.
 - Never silently schedule something David didn't give a time for — always propose first and wait for a yes.
 - If David gives an explicit time, the above wait-for-confirmation rule does not apply — go ahead and call add_task immediately.
 
 TOOLS — update_task (moving/editing existing tasks):
-- Use this when David asks to move, reschedule, rename, or change the duration of something already on TODAY'S SCHEDULE. Find the matching task by title and use its id.
+- Use this when David asks to move, reschedule, rename, or change the duration of something already on UPCOMING SCHEDULE. Find the matching task by title (and date, if he mentions one or it's otherwise ambiguous) and use its id.
 - Same confirmation rule as add_task: if David gives an explicit new time ("move my run to 7am"), call update_task right away. If he's vague ("move my run to the morning", "push cleaning back a bit"), propose a specific new time first and wait for a yes before calling update_task.
 - Only change the fields David actually wants changed — omit the rest.
+- If multiple tasks could match what David said (e.g. a recurring task appears on several dates), ask which one he means instead of guessing.
+
+TOOLS — delete_task (removing existing tasks):
+- Use this when David asks to delete, remove, or cancel something already on UPCOMING SCHEDULE. Find the matching task by title (and date if needed to disambiguate).
+- Always confirm before deleting — never call delete_task on the first ask. Reply with exactly: "Got it — you want me to delete [task name]? Just confirm and I'll remove it." (using the real task title in place of [task name]).
+- Only call delete_task after David clearly confirms (e.g. "yes", "confirm", "do it").
 - If multiple tasks could match what David said, ask which one he means instead of guessing.
 
 TOOLS — review_schedule (on-demand conflict check):
@@ -233,6 +239,22 @@ export interface UpdateTaskToolInput {
   durationMinutes?: number;
 }
 
+const DELETE_TASK_TOOL = {
+  name: 'delete_task',
+  description: "Delete an existing task from the user's schedule. Only call this after the user has explicitly confirmed the deletion in chat.",
+  input_schema: {
+    type: 'object',
+    properties: {
+      taskId: { type: 'string', description: "The task's id, copied exactly from TODAY'S SCHEDULE." },
+    },
+    required: ['taskId'],
+  },
+};
+
+export interface DeleteTaskToolInput {
+  taskId: string;
+}
+
 const REVIEW_SCHEDULE_TOOL = {
   name: 'review_schedule',
   description: "Runs a fresh conflict check (overlaps, commute windows, Thursday date night) against the user's current schedule. Call only when the user explicitly asks for a review.",
@@ -262,7 +284,7 @@ async function callClaudeRaw(
       max_tokens: maxTokens,
       system:     systemPrompt,
       messages,
-      tools:      [ADD_TASK_TOOL, UPDATE_TASK_TOOL, REVIEW_SCHEDULE_TOOL],
+      tools:      [ADD_TASK_TOOL, UPDATE_TASK_TOOL, DELETE_TASK_TOOL, REVIEW_SCHEDULE_TOOL],
     }),
   });
 
@@ -279,11 +301,13 @@ export interface PlannerTurnResult {
   replyText: string;
   addedTasks: AddTaskToolInput[];
   updatedTasks: UpdateTaskToolInput[];
+  deletedTasks: DeleteTaskToolInput[];
 }
 
 export interface PlannerToolExecutors {
   executeAddTask:      (input: AddTaskToolInput) => Promise<{ success: boolean; message: string }>;
   executeUpdateTask:   (input: UpdateTaskToolInput) => Promise<{ success: boolean; message: string }>;
+  executeDeleteTask:   (input: DeleteTaskToolInput) => Promise<{ success: boolean; message: string }>;
   executeReviewSchedule: () => Promise<{ success: boolean; message: string }>;
 }
 
@@ -296,6 +320,7 @@ export async function runPlannerTurn(
   let messages: AnthropicMessage[] = [...history, { role: 'user', content: userText }];
   const addedTasks: AddTaskToolInput[] = [];
   const updatedTasks: UpdateTaskToolInput[] = [];
+  const deletedTasks: DeleteTaskToolInput[] = [];
   let replyText = '';
 
   for (let i = 0; i < 5; i++) {
@@ -325,6 +350,11 @@ export async function runPlannerTurn(
         const result = await executors.executeUpdateTask(input);
         if (result.success) updatedTasks.push(input);
         toolResults.push({ type: 'tool_result', tool_use_id: call.id, content: result.message });
+      } else if (call.name === 'delete_task') {
+        const input = call.input as unknown as DeleteTaskToolInput;
+        const result = await executors.executeDeleteTask(input);
+        if (result.success) deletedTasks.push(input);
+        toolResults.push({ type: 'tool_result', tool_use_id: call.id, content: result.message });
       } else if (call.name === 'review_schedule') {
         const result = await executors.executeReviewSchedule();
         toolResults.push({ type: 'tool_result', tool_use_id: call.id, content: result.message });
@@ -335,7 +365,7 @@ export async function runPlannerTurn(
     messages = [...messages, { role: 'user', content: toolResults }];
   }
 
-  return { history: messages, replyText, addedTasks, updatedTasks };
+  return { history: messages, replyText, addedTasks, updatedTasks, deletedTasks };
 }
 
 // ─── End-of-day summary ────────────────────────────────────────────────────────

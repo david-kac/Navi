@@ -8,12 +8,13 @@ import { useRouter } from 'expo-router';
 import { ChevronLeft, AlertTriangle, CheckCircle2 } from 'lucide-react-native';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../lib/AuthProvider';
-import { buildDotSystemPrompt, runPlannerTurn, AnthropicMessage, AddTaskToolInput, UpdateTaskToolInput } from '../lib/ai';
+import { buildDotSystemPrompt, runPlannerTurn, AnthropicMessage, AddTaskToolInput, UpdateTaskToolInput, DeleteTaskToolInput } from '../lib/ai';
 import { detectConflicts, Conflict, TaskSlot } from '../lib/conflicts';
 import { generateTasksForDate } from '../lib/recurring';
 import { shouldShowMorningFlow, markMorningFlowShown } from '../lib/morningGate';
 import { getVerseOfTheDay, Verse } from '../lib/verseOfTheDay';
 import type { Database } from '../lib/database.types';
+import { getTimePeriod } from '../lib/database.types';
 
 type TaskRow = Database['public']['Tables']['tasks']['Row'];
 type CategoryRow = Database['public']['Tables']['categories']['Row'];
@@ -43,6 +44,14 @@ type Stage = 'loading' | 'chatting' | 'locked';
 
 interface DisplayMessage { id: string; kind: 'user' | 'dot' | 'added'; text: string }
 
+const UPCOMING_WINDOW_DAYS = 28; // 4 weeks, including today
+
+function addDays(d: Date, days: number): Date {
+  const next = new Date(d);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
 async function fetchTodayState(userId: string, today: string): Promise<{ rows: TaskRow[]; conflicts: Conflict[] }> {
   await generateTasksForDate(userId, today);
   const { data: rows, error } = await supabase
@@ -63,6 +72,28 @@ async function fetchTodayState(userId: string, today: string): Promise<{ rows: T
   }));
   const isThursday = new Date().getDay() === 4;
   return { rows: taskRows, conflicts: detectConflicts(slots, isThursday) };
+}
+
+// Materializes recurring tasks for every day in the upcoming window, then
+// returns every task (today through 4 weeks out) so Dot can plan ahead —
+// not just react to what's already on today.
+async function fetchUpcomingTasks(userId: string, today: string): Promise<TaskRow[]> {
+  const start = new Date(`${today}T00:00:00`);
+  for (let i = 0; i < UPCOMING_WINDOW_DAYS; i++) {
+    await generateTasksForDate(userId, toISODate(addDays(start, i)));
+  }
+  const endDate = toISODate(addDays(start, UPCOMING_WINDOW_DAYS - 1));
+
+  const { data: rows, error } = await supabase
+    .from('tasks')
+    .select('*')
+    .eq('user_id', userId)
+    .gte('date', today)
+    .lte('date', endDate)
+    .order('date', { ascending: true })
+    .order('scheduled_time', { ascending: true });
+  if (error) { console.error(error); return []; }
+  return (rows ?? []) as TaskRow[];
 }
 
 export default function DotChat() {
@@ -88,15 +119,16 @@ export default function DotChat() {
       ? categories.find(c => c.name.toLowerCase() === taskInput.categoryName!.toLowerCase())
       : undefined;
     const date = taskInput.date && /^\d{4}-\d{2}-\d{2}$/.test(taskInput.date) ? taskInput.date : toISODate(new Date());
+    const scheduledTime = taskInput.scheduledTime ? `${taskInput.scheduledTime}:00` : null;
 
     const { error } = await supabase.from('tasks').insert({
       user_id:           userId,
       title:             taskInput.title,
       category_id:       matchedCategory?.id ?? null,
       date,
-      scheduled_time:    taskInput.scheduledTime ? `${taskInput.scheduledTime}:00` : null,
+      scheduled_time:    scheduledTime,
       duration_minutes:  taskInput.durationMinutes ?? null,
-      time_period:       'unscheduled',
+      time_period:       getTimePeriod(scheduledTime),
     });
 
     if (error) {
@@ -111,7 +143,10 @@ export default function DotChat() {
     const patch: Database['public']['Tables']['tasks']['Update'] = {};
     if (taskInput.title !== undefined) patch.title = taskInput.title;
     if (taskInput.date !== undefined) patch.date = taskInput.date;
-    if (taskInput.scheduledTime !== undefined) patch.scheduled_time = `${taskInput.scheduledTime}:00`;
+    if (taskInput.scheduledTime !== undefined) {
+      patch.scheduled_time = `${taskInput.scheduledTime}:00`;
+      patch.time_period = getTimePeriod(patch.scheduled_time);
+    }
     if (taskInput.durationMinutes !== undefined) patch.duration_minutes = taskInput.durationMinutes;
 
     const { data: row, error } = await supabase
@@ -127,6 +162,25 @@ export default function DotChat() {
     }
     setDisplay(prev => [...prev, { id: `updated-${Date.now()}`, kind: 'added', text: `✎ Updated "${row.title}"` }]);
     return { success: true, message: 'Task updated successfully.' };
+  }, []);
+
+  const executeDeleteTask = useCallback(async (taskInput: DeleteTaskToolInput): Promise<{ success: boolean; message: string }> => {
+    const { data: row, error: fetchError } = await supabase
+      .from('tasks')
+      .select('title')
+      .eq('id', taskInput.taskId)
+      .single();
+    if (fetchError || !row) {
+      return { success: false, message: `Failed to delete task: ${fetchError?.message ?? 'not found'}` };
+    }
+
+    const { error } = await supabase.from('tasks').delete().eq('id', taskInput.taskId);
+    if (error) {
+      console.error(error);
+      return { success: false, message: `Failed to delete task: ${error.message}` };
+    }
+    setDisplay(prev => [...prev, { id: `deleted-${Date.now()}`, kind: 'added', text: `- Removed "${row.title}"` }]);
+    return { success: true, message: 'Task deleted successfully.' };
   }, []);
 
   const executeReviewSchedule = useCallback(async (): Promise<{ success: boolean; message: string }> => {
@@ -153,14 +207,15 @@ export default function DotChat() {
     const { data: catRows } = await supabase.from('categories').select('*').eq('user_id', userId);
     setCategories(catRows ?? []);
 
-    const { rows: taskRows, conflicts: detected } = await fetchTodayState(userId, today);
+    const { conflicts: detected } = await fetchTodayState(userId, today);
     setConflicts(detected);
 
-    const todayTasks = taskRows.length
-      ? taskRows.map(r => {
+    const upcomingRows = await fetchUpcomingTasks(userId, today);
+    const upcomingTasks = upcomingRows.length
+      ? upcomingRows.map(r => {
           const when = r.scheduled_time ? fmt12(r.scheduled_time) : 'unscheduled';
           const dur = r.duration_minutes ? ` (${r.duration_minutes} min)` : '';
-          return `- [${r.id}] ${r.title} — ${when}${dur}`;
+          return `- [${r.id}] ${r.date} — ${r.title} — ${when}${dur}`;
         }).join('\n')
       : 'Nothing scheduled yet.';
 
@@ -174,7 +229,7 @@ export default function DotChat() {
       time:       now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }),
       dayOfWeek:  now.toLocaleDateString('en-US', { weekday: 'long' }),
       isThursday: now.getDay() === 4,
-      todayTasks,
+      upcomingTasks,
       conflicts:  detected.length ? detected.map(c => c.message).join('\n') : 'None.',
       categoryNames: (catRows ?? []).map(c => c.name),
       mode: sessionMode,
@@ -188,7 +243,7 @@ export default function DotChat() {
 
     setSending(true);
     try {
-      const result = await runPlannerTurn(system, [], kickoff, { executeAddTask, executeUpdateTask, executeReviewSchedule });
+      const result = await runPlannerTurn(system, [], kickoff, { executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule });
       historyRef.current = result.history;
       setDisplay(prev => [...prev, { id: 'greet', kind: 'dot', text: result.replyText }]);
       setStage('chatting');
@@ -198,7 +253,7 @@ export default function DotChat() {
     } finally {
       setSending(false);
     }
-  }, [userId, executeAddTask, executeUpdateTask, executeReviewSchedule]);
+  }, [userId, executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule]);
 
   useEffect(() => { greet(); }, [userId]);
 
@@ -209,7 +264,7 @@ export default function DotChat() {
     setInput('');
     setSending(true);
     try {
-      const result = await runPlannerTurn(systemPromptRef.current, historyRef.current, text, { executeAddTask, executeUpdateTask, executeReviewSchedule });
+      const result = await runPlannerTurn(systemPromptRef.current, historyRef.current, text, { executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule });
       historyRef.current = result.history;
       setDisplay(prev => [...prev, { id: `a-${Date.now()}`, kind: 'dot', text: result.replyText }]);
     } catch (e) {

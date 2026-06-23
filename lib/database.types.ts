@@ -459,6 +459,18 @@ export const Constants = {
 // App-level convenience aliases for the loosely-typed text columns above
 // (Postgres CHECK constraints aren't reflected in the generated types).
 export type TimePeriod = 'morning' | 'afternoon' | 'evening' | 'unscheduled'
+
+// Derives the display bucket for a task from its scheduled time (Postgres
+// `time` literal, e.g. "14:30:00"). Morning < 12pm, afternoon 12-5pm,
+// evening >= 5pm; tasks with no start time are truly unscheduled.
+export function getTimePeriod(scheduledTime?: string | null): TimePeriod {
+  if (!scheduledTime) return 'unscheduled'
+  const hour = parseInt(scheduledTime.split(':')[0], 10)
+  if (hour < 12) return 'morning'
+  if (hour < 17) return 'afternoon'
+  return 'evening'
+}
+
 export type GoalStatus = 'active' | 'completed' | 'archived'
 export type RecurrenceType = 'daily' | 'weekly' | 'custom'
 export type ScheduleBlockType = 'commute' | 'date-night' | 'sleep' | 'custom'

@@ -5,7 +5,7 @@ import {
   ScrollView, NativeSyntheticEvent, NativeScrollEvent,
 } from 'react-native';
 import { ChevronDown, RefreshCw, Clock, Calendar, Link } from 'lucide-react-native';
-import { DEFAULT_CATEGORIES, Category } from '../constants/categories';
+import { DEFAULT_CATEGORIES, Category, OPEN_CATEGORY_ID } from '../constants/categories';
 import InlineCalendar from './InlineCalendar';
 
 const INK    = '#2D2D2D';
@@ -276,7 +276,7 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, categori
 
     if (editingTask) {
       setTitle(editingTask.title);
-      setCategoryId(editingTask.categoryId ?? options[0]?.id ?? '');
+      setCategoryId(editingTask.categoryId ?? OPEN_CATEGORY_ID);
       setDuration(editingTask.durationMinutes ? String(editingTask.durationMinutes) : '');
       setDate(new Date(`${editingTask.date}T00:00:00`));
       if (editingTask.scheduledTime) {

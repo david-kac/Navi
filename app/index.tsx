@@ -8,11 +8,13 @@ import { useRouter, useFocusEffect } from 'expo-router';
 import DotCharacter, { DotMood } from '../components/DotCharacter';
 import AddTaskModal, { NewTask, EditableTask } from '../components/AddTaskModal';
 import TaskActionSheet from '../components/TaskActionSheet';
+import CategoryActionSheet from '../components/CategoryActionSheet';
 import InlineCalendar from '../components/InlineCalendar';
-import { DEFAULT_CATEGORIES } from '../constants/categories';
+import { DEFAULT_CATEGORIES, OPEN_CATEGORY, OPEN_CATEGORY_ID } from '../constants/categories';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../lib/AuthProvider';
 import type { Database } from '../lib/database.types';
+import { getTimePeriod } from '../lib/database.types';
 import { generateTasksForDate, deleteRecurringOccurrence, deleteRecurringSeries } from '../lib/recurring';
 import { generateEndOfDaySummary } from '../lib/ai';
 import { shouldShowMorningFlow } from '../lib/morningGate';
@@ -68,7 +70,7 @@ function rowToTask(row: TaskRow): Task {
     durationMins:    row.duration_minutes ?? undefined,
     isRecurring:     row.recurring_rule_id !== null,
     isCompleted:     row.is_completed,
-    timePeriod:      row.time_period as TimePeriod,
+    timePeriod:      getTimePeriod(row.scheduled_time),
     isTTFO:          row.is_ttfo,
   };
 }
@@ -248,9 +250,11 @@ function SectionHeader({ title }: { title: string }) {
 
 // ─── Task card ─────────────────────────────────────────────────────────────────
 function TaskCard({ task, icon, onToggle, onLongPress }: { task: Task; icon: string; onToggle: (id: string) => void; onLongPress: (task: Task) => void }) {
-  const sub = task.scheduledTime
-    ? [fmt12(task.scheduledTime), task.durationMins && `${task.durationMins}m`].filter(Boolean).join(' · ')
-    : null;
+  const subParts = [
+    task.scheduledTime && fmt12(task.scheduledTime),
+    task.durationMins && `${task.durationMins}m`,
+  ].filter(Boolean);
+  const sub = subParts.length ? subParts.join(' · ') : null;
   return (
     <TouchableOpacity
       style={[s.card, task.isCompleted && s.cardFaded]}
@@ -402,10 +406,10 @@ function WeekView({ tab, onTabChange, weekCats }: { tab: ActiveTab; onTabChange:
 interface CatsViewProps {
   tab: ActiveTab;
   onTabChange: (t: ActiveTab) => void;
-  categories: CategoryRow[];
+  categories: Pick<CategoryRow, 'id' | 'name' | 'icon'>[];
   tasks: Task[];
   onToggleTask: (id: string) => void;
-  onDeleteTask: (id: string) => void;
+  onLongPressTask: (task: Task) => void;
   onAddTask: (categoryId: string, title: string) => void;
   onAddCategory: (name: string, icon: string) => void;
   onDeleteCategory: (id: string) => void;
@@ -413,13 +417,15 @@ interface CatsViewProps {
 
 function CatsView({
   tab, onTabChange, categories, tasks,
-  onToggleTask, onDeleteTask, onAddTask, onAddCategory, onDeleteCategory,
+  onToggleTask, onLongPressTask, onAddTask, onAddCategory, onDeleteCategory,
 }: CatsViewProps) {
   const [expanded,    setExpanded]    = useState<Set<string>>(new Set());
   const [showNew,     setShowNew]     = useState(false);
   const [newName,     setNewName]     = useState('');
   const [selIcon,     setSelIcon]     = useState(0);
   const [draftTitles, setDraftTitles] = useState<Record<string, string>>({});
+  const [categoryActionId, setCategoryActionId] = useState<string | null>(null);
+  const categoryAction = categories.find(c => c.id === categoryActionId) ?? null;
 
   const toggleExpanded = (id: string) => setExpanded(prev => {
     const next = new Set(prev);
@@ -442,13 +448,15 @@ function CatsView({
 
       {categories.map(cat => {
         const isExp    = expanded.has(cat.id);
-        const catTasks = tasks.filter(t => t.categoryId === cat.id);
+        const catTasks = tasks.filter(t => cat.id === OPEN_CATEGORY_ID ? t.categoryId === null : t.categoryId === cat.id);
         return (
           <View key={cat.id} style={s.accordion}>
             {/* Header */}
             <TouchableOpacity
               style={[s.accHeader, isExp && s.accHeaderExp]}
               onPress={() => toggleExpanded(cat.id)}
+              onLongPress={() => setCategoryActionId(cat.id)}
+              delayLongPress={400}
               activeOpacity={0.8}
             >
               <NamedIcon name={cat.icon} size={13} color={isExp ? BG : INK} />
@@ -458,28 +466,36 @@ function CatsView({
               {isExp
                 ? <ChevronUp   size={11} color={BG}  strokeWidth={2} />
                 : <ChevronDown size={11} color={INK} strokeWidth={2} />}
-              <TouchableOpacity onPress={() => onDeleteCategory(cat.id)} style={{ padding: 2 }}>
-                <X size={11} color={isExp ? BG : MUTED} strokeWidth={1.5} />
-              </TouchableOpacity>
             </TouchableOpacity>
 
             {/* Body */}
             {isExp && (
               <View style={s.accBody}>
                 {catTasks.map(t => (
-                  <View key={t.id} style={s.accTask}>
+                  <TouchableOpacity
+                    key={t.id}
+                    style={s.accTask}
+                    onLongPress={() => onLongPressTask(t)}
+                    delayLongPress={400}
+                    activeOpacity={0.85}
+                  >
                     <TouchableOpacity onPress={() => onToggleTask(t.id)}>
                       <View style={[s.accCheckbox, t.isCompleted && s.checkboxOn]}>
                         {t.isCompleted && <Text style={s.checkmark}>✓</Text>}
                       </View>
                     </TouchableOpacity>
-                    <Text style={[s.accTaskName, t.isCompleted && s.cardTitleDone]}>{t.title}</Text>
-                    <View style={{ flex: 1 }} />
+                    <View style={s.accTaskContent}>
+                      <Text style={[s.accTaskName, t.isCompleted && s.cardTitleDone]}>{t.title}</Text>
+                      {(() => {
+                        const parts = [
+                          t.scheduledTime && fmt12(t.scheduledTime),
+                          t.durationMins && `${t.durationMins}m`,
+                        ].filter(Boolean);
+                        return parts.length ? <Text style={s.accTaskSub}>{parts.join(' · ')}</Text> : null;
+                      })()}
+                    </View>
                     {t.isRecurring && <Repeat size={11} color={MUTED} strokeWidth={1.5} />}
-                    <TouchableOpacity onPress={() => onDeleteTask(t.id)}>
-                      <X size={11} color={MUTED} strokeWidth={1.5} />
-                    </TouchableOpacity>
-                  </View>
+                  </TouchableOpacity>
                 ))}
                 {/* Inline add */}
                 <View style={s.accAddRow}>
@@ -552,6 +568,17 @@ function CatsView({
       )}
 
       <View style={{ height: 32 }} />
+
+      <CategoryActionSheet
+        visible={!!categoryAction}
+        categoryName={categoryAction?.name ?? ''}
+        canDelete={categoryActionId !== OPEN_CATEGORY_ID}
+        onClose={() => setCategoryActionId(null)}
+        onDelete={() => {
+          if (categoryActionId) onDeleteCategory(categoryActionId);
+          setCategoryActionId(null);
+        }}
+      />
     </ScrollView>
   );
 }
@@ -605,11 +632,24 @@ export default function HomeScreen() {
     if (error) { console.error(error); return; }
 
     if (!data || data.length === 0) {
-      const { data: seeded, error: seedError } = await supabase
+      // Upsert with ignoreDuplicates rather than a plain insert: a concurrent
+      // call to loadCategories (e.g. a second focus event firing before this
+      // one resolves) could see zero rows too and race to seed the same
+      // defaults. The (user_id, name) unique index makes that race a no-op
+      // instead of producing duplicate categories.
+      const { error: seedError } = await supabase
         .from('categories')
-        .insert(DEFAULT_CATEGORIES.map(c => ({ user_id: userId, name: c.name, icon: c.icon, color: c.color ?? null })))
-        .select('*');
+        .upsert(
+          DEFAULT_CATEGORIES.map(c => ({ user_id: userId, name: c.name, icon: c.icon, color: c.color ?? null })),
+          { onConflict: 'user_id,name', ignoreDuplicates: true }
+        );
       if (seedError) { console.error(seedError); return; }
+      const { data: seeded, error: refetchError } = await supabase
+        .from('categories')
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: true });
+      if (refetchError) { console.error(refetchError); return; }
       setCategories(seeded ?? []);
       return;
     }
@@ -635,8 +675,10 @@ export default function HomeScreen() {
     if (error) console.error(error);
   }, []);
 
+  const categoriesWithOpen = useMemo(() => [...categories, OPEN_CATEGORY], [categories]);
+
   const categoryIconMap = useMemo(
-    () => Object.fromEntries(categories.map(c => [c.id, c.icon])),
+    () => ({ '': OPEN_CATEGORY.icon, ...Object.fromEntries(categories.map(c => [c.id, c.icon])) }),
     [categories]
   );
 
@@ -733,11 +775,11 @@ export default function HomeScreen() {
   const updateTask = useCallback(async (id: string, nt: NewTask) => {
     const scheduledTime   = nt.startTime ? to24Hour(nt.startTime) : null;
     const durationMinutes = nt.duration ? parseInt(nt.duration, 10) : null;
-    const categoryId      = nt.categoryId || null;
+    const categoryId      = (!nt.categoryId || nt.categoryId === OPEN_CATEGORY_ID) ? null : nt.categoryId;
 
     const { data: row, error } = await supabase
       .from('tasks')
-      .update({ title: nt.title, category_id: categoryId, date: nt.date, scheduled_time: scheduledTime, duration_minutes: durationMinutes })
+      .update({ title: nt.title, category_id: categoryId, date: nt.date, scheduled_time: scheduledTime, duration_minutes: durationMinutes, time_period: getTimePeriod(scheduledTime) })
       .eq('id', id)
       .select('*')
       .single();
@@ -754,7 +796,7 @@ export default function HomeScreen() {
     if (!userId) return;
     const scheduledTime    = nt.startTime ? to24Hour(nt.startTime) : null;
     const durationMinutes  = nt.duration ? parseInt(nt.duration, 10) : null;
-    const categoryId       = nt.categoryId || null;
+    const categoryId       = (!nt.categoryId || nt.categoryId === OPEN_CATEGORY_ID) ? null : nt.categoryId;
 
     let recurringRuleId: string | null = null;
     if (nt.isRecurring) {
@@ -767,6 +809,7 @@ export default function HomeScreen() {
           rule_type:        'daily',
           scheduled_time:   scheduledTime,
           duration_minutes: durationMinutes,
+          time_period:      getTimePeriod(scheduledTime),
         })
         .select('id')
         .single();
@@ -784,7 +827,7 @@ export default function HomeScreen() {
         date:              nt.date,
         scheduled_time:    scheduledTime,
         duration_minutes:  durationMinutes,
-        time_period:       'unscheduled',
+        time_period:       getTimePeriod(scheduledTime),
       })
       .select('*')
       .single();
@@ -874,10 +917,10 @@ export default function HomeScreen() {
         <CatsView
           tab={tab}
           onTabChange={t => { setTab(t); setShowCal(false); }}
-          categories={categories}
+          categories={categoriesWithOpen}
           tasks={tasks}
           onToggleTask={toggle}
-          onDeleteTask={remove}
+          onLongPressTask={setActionTask}
           onAddTask={(categoryId, title) => addTask({ title, categoryId, date: toISODate(selectedDate), startTime: '', duration: '', isRecurring: false })}
           onAddCategory={addCategory}
           onDeleteCategory={removeCategory}
@@ -890,7 +933,7 @@ export default function HomeScreen() {
         onClose={() => { setShowAddTask(false); setEditingTask(null); }}
         onAdd={addTask}
         onSave={(id, nt) => updateTask(id, nt)}
-        categories={categories}
+        categories={categoriesWithOpen}
         initialDate={toISODate(selectedDate)}
         editingTask={editingTask ? {
           id: editingTask.id,
@@ -1043,7 +1086,9 @@ const s = StyleSheet.create({
   },
   accTask:     { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 10, borderBottomWidth: DASH, borderBottomColor: INK, gap: 8 },
   accCheckbox: { width: 15, height: 15, borderWidth: BORDER, borderColor: INK },
-  accTaskName: { fontFamily: 'VT323', fontSize: 16, color: INK, lineHeight: 18, flex: 1 },
+  accTaskContent: { flex: 1 },
+  accTaskName: { fontFamily: 'VT323', fontSize: 16, color: INK, lineHeight: 18 },
+  accTaskSub:  { fontFamily: 'PressStart2P', fontSize: 6, color: MUTED, lineHeight: 9, marginTop: 2 },
   accAddRow:   { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 10, gap: 10 },
   accAddPlaceholder: { flex: 1, fontFamily: 'VT323', fontSize: 15, color: MUTED, lineHeight: 18 },
   accAddInput: { flex: 1, fontFamily: 'VT323', fontSize: 15, color: INK, lineHeight: 18, padding: 0 },

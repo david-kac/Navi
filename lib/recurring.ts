@@ -1,4 +1,5 @@
 import { supabase } from './supabase';
+import { getTimePeriod } from './database.types';
 
 const UNIQUE_VIOLATION = '23505';
 
@@ -53,7 +54,7 @@ export async function generateTasksForDate(userId: string, isoDate: string): Pro
       date:               isoDate,
       scheduled_time:     rule.scheduled_time,
       duration_minutes:   rule.duration_minutes,
-      time_period:        rule.time_period,
+      time_period:        getTimePeriod(rule.scheduled_time),
     });
     if (insertError && insertError.code !== UNIQUE_VIOLATION) {
       console.error(insertError);
