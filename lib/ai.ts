@@ -368,6 +368,100 @@ export async function runPlannerTurn(
   return { history: messages, replyText, addedTasks, updatedTasks, deletedTasks };
 }
 
+// ─── Asset analysis → suggested tasks ────────────────────────────────────────
+
+export type AssetMimeType = 'image/jpeg' | 'image/png' | 'application/pdf';
+
+export interface SuggestedTask {
+  title: string;
+  date: string | null;          // YYYY-MM-DD
+  scheduledTime: string | null; // HH:MM 24-hour
+  durationMinutes: number | null;
+  categoryName: string | null;
+}
+
+export async function analyzeAssetAndSuggestTasks({
+  fileBase64,
+  mimeType,
+  description,
+  today,
+  categoryNames,
+}: {
+  fileBase64: string;
+  mimeType: AssetMimeType;
+  description: string;
+  today: string;
+  categoryNames: string[];
+}): Promise<SuggestedTask[]> {
+  const apiKey = await getAnthropicApiKey();
+  if (!apiKey) throw new Error('No API key set. Long-press Dot to open settings.');
+
+  const isPdf = mimeType === 'application/pdf';
+
+  const fileBlock = isPdf
+    ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: fileBase64 } }
+    : { type: 'image',    source: { type: 'base64', media_type: mimeType,            data: fileBase64 } };
+
+  const system = `You are a task extraction assistant. Given a document or image and a description of what to do with it, extract every actionable task and return them as a JSON array.
+
+Today is ${today}. Available categories: ${categoryNames.length ? categoryNames.join(', ') : '(none)'}.
+
+Return ONLY a raw JSON array — no prose, no markdown fences. Each element:
+{"title": string, "date": "YYYY-MM-DD" or null, "scheduledTime": "HH:MM" 24-hour or null, "durationMinutes": number or null, "categoryName": string matching an available category or null}
+
+Rules:
+- Infer specific dates where possible (e.g. "Week 1 Monday" → actual YYYY-MM-DD starting from today).
+- For multi-week plans, spread tasks across the correct future dates.
+- categoryName must exactly match one of the available categories, or be null.
+- Extract every distinct actionable item — don't summarise or merge.`;
+
+  const headers: Record<string, string> = {
+    'content-type':     'application/json',
+    'x-api-key':         apiKey,
+    'anthropic-version': '2023-06-01',
+  };
+  if (isPdf) headers['anthropic-beta'] = 'pdfs-2024-09-25';
+
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model:      CLAUDE_MODEL,
+      max_tokens: 4096,
+      system,
+      messages: [{
+        role: 'user',
+        content: [
+          fileBlock,
+          { type: 'text', text: description || 'Extract all tasks from this document.' },
+        ],
+      }],
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Claude API error ${res.status}: ${body}`);
+  }
+
+  const data = await res.json() as { content: Array<{ type: string; text: string }> };
+  const raw = data.content.find(b => b.type === 'text')?.text ?? '[]';
+  const json = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+
+  let parsed: unknown;
+  try { parsed = JSON.parse(json); } catch { throw new Error('Could not parse task list from Dot\'s response.'); }
+
+  if (!Array.isArray(parsed)) throw new Error('Expected a list of tasks.');
+
+  return (parsed as Partial<SuggestedTask>[]).map(p => ({
+    title:           typeof p.title === 'string' ? p.title.trim() : 'Untitled task',
+    date:            typeof p.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(p.date) ? p.date : null,
+    scheduledTime:   typeof p.scheduledTime === 'string' && /^\d{2}:\d{2}$/.test(p.scheduledTime) ? p.scheduledTime : null,
+    durationMinutes: typeof p.durationMinutes === 'number' ? p.durationMinutes : null,
+    categoryName:    typeof p.categoryName === 'string' ? p.categoryName : null,
+  })).filter(t => t.title);
+}
+
 // ─── End-of-day summary ────────────────────────────────────────────────────────
 
 export interface EndOfDayTask {

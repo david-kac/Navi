@@ -1,11 +1,17 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   View, Text, ScrollView, TextInput, TouchableOpacity, StyleSheet,
-  ActivityIndicator, KeyboardAvoidingView, Platform,
+  ActivityIndicator, KeyboardAvoidingView, Platform, Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
-import { ChevronLeft, AlertTriangle, CheckCircle2 } from 'lucide-react-native';
+import { ChevronLeft, AlertTriangle, CheckCircle2, Paperclip, X } from 'lucide-react-native';
+import * as ImagePicker from 'expo-image-picker';
+import * as DocumentPicker from 'expo-document-picker';
+import * as FileSystem from 'expo-file-system';
+import { analyzeAssetAndSuggestTasks, SuggestedTask, AssetMimeType } from '../lib/ai';
+import TaskPreviewModal from '../components/TaskPreviewModal';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../lib/AuthProvider';
 import { buildDotSystemPrompt, runPlannerTurn, AnthropicMessage, AddTaskToolInput, UpdateTaskToolInput, DeleteTaskToolInput } from '../lib/ai';
@@ -112,6 +118,12 @@ export default function DotChat() {
   const historyRef = useRef<AnthropicMessage[]>([]);
   const scrollRef = useRef<ScrollView>(null);
 
+  interface AttachedFile { base64: string; mimeType: AssetMimeType; name: string }
+  const [attachment,     setAttachment]     = useState<AttachedFile | null>(null);
+  const [analyzing,      setAnalyzing]      = useState(false);
+  const [suggestedTasks, setSuggestedTasks] = useState<SuggestedTask[]>([]);
+  const [showPreview,    setShowPreview]    = useState(false);
+
   const executeAddTask = useCallback(async (taskInput: AddTaskToolInput): Promise<{ success: boolean; message: string }> => {
     if (!userId) return { success: false, message: 'Not signed in.' };
 
@@ -193,6 +205,81 @@ export default function DotChat() {
     return { success: true, message };
   }, [userId]);
 
+  const pickPhoto = async () => {
+    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (status !== 'granted') {
+      Alert.alert('Permission needed', 'Allow photo library access in Settings to upload images.');
+      return;
+    }
+    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], base64: true, quality: 0.7 });
+    if (result.canceled || !result.assets[0]) return;
+    const asset = result.assets[0];
+    setAttachment({ base64: asset.base64!, mimeType: asset.mimeType === 'image/png' ? 'image/png' : 'image/jpeg', name: asset.fileName ?? 'image.jpg' });
+  };
+
+  const pickFile = async () => {
+    const result = await DocumentPicker.getDocumentAsync({ type: ['application/pdf', 'image/jpeg', 'image/png'], copyToCacheDirectory: true });
+    if (result.canceled || !result.assets[0]) return;
+    const asset = result.assets[0];
+    const base64 = await FileSystem.readAsStringAsync(asset.uri, { encoding: 'base64' as const });
+    const rawMime = asset.mimeType ?? '';
+    const mime: AssetMimeType = rawMime === 'application/pdf' ? 'application/pdf' : rawMime === 'image/png' ? 'image/png' : 'image/jpeg';
+    setAttachment({ base64, mimeType: mime, name: asset.name });
+  };
+
+  const openPicker = () => {
+    Alert.alert('Upload File', 'Choose a source', [
+      { text: 'Photos', onPress: pickPhoto },
+      { text: 'Files',  onPress: pickFile  },
+      { text: 'Cancel', style: 'cancel'    },
+    ]);
+  };
+
+  const analyzeAttachment = async () => {
+    if (!attachment) return;
+    setAnalyzing(true);
+    try {
+      const today = toISODate(new Date());
+      const tasks = await analyzeAssetAndSuggestTasks({
+        fileBase64:   attachment.base64,
+        mimeType:     attachment.mimeType,
+        description:  input.trim() || 'Extract all tasks from this document.',
+        today,
+        categoryNames: categories.map(c => c.name),
+      });
+      setSuggestedTasks(tasks);
+      setShowPreview(true);
+    } catch (e) {
+      Alert.alert('Analysis failed', e instanceof Error ? e.message : 'Something went wrong.');
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  const confirmTasks = async (tasks: SuggestedTask[]) => {
+    setShowPreview(false);
+    setAttachment(null);
+    setInput('');
+    if (!userId) return;
+    const today = toISODate(new Date());
+    let created = 0;
+    for (const t of tasks) {
+      const matchedCat = categories.find(c => c.name.toLowerCase() === t.categoryName?.toLowerCase());
+      const scheduledTime = t.scheduledTime ? `${t.scheduledTime}:00` : null;
+      const { error } = await supabase.from('tasks').insert({
+        user_id:           userId,
+        title:             t.title,
+        category_id:       matchedCat?.id ?? null,
+        date:              t.date ?? today,
+        scheduled_time:    scheduledTime,
+        duration_minutes:  t.durationMinutes ?? null,
+        time_period:       getTimePeriod(scheduledTime),
+      });
+      if (!error) created++;
+    }
+    setDisplay(prev => [...prev, { id: `added-${Date.now()}`, kind: 'added', text: `+ Created ${created} task${created !== 1 ? 's' : ''} from your upload` }]);
+  };
+
   const greet = useCallback(async () => {
     if (!userId) return;
     setStage('loading');
@@ -237,6 +324,20 @@ export default function DotChat() {
     });
     systemPromptRef.current = system;
 
+    // Restore persisted chat from earlier today — skip the greeting if found.
+    try {
+      const persisted = await AsyncStorage.getItem(`dot_chat_${today}`);
+      if (persisted) {
+        const { history, display: savedDisplay } = JSON.parse(persisted);
+        historyRef.current = history;
+        setDisplay(savedDisplay);
+        setStage('chatting');
+        return;
+      }
+    } catch (e) {
+      console.error('Failed to load chat history:', e);
+    }
+
     const kickoff = sessionMode === 'morning'
       ? "Give me my morning greeting, share today's verse exactly as written, and a quick summary of today. Keep it short."
       : 'Just say a short casual hello and ask what\'s on my mind. Keep it to one sentence.';
@@ -257,7 +358,18 @@ export default function DotChat() {
 
   useEffect(() => { greet(); }, [userId]);
 
+  // Persist the full chat to AsyncStorage after each completed exchange so it
+  // survives navigation. The key is date-scoped, so tomorrow starts fresh.
+  useEffect(() => {
+    if (stage !== 'chatting' || sending) return;
+    AsyncStorage.setItem(
+      `dot_chat_${toISODate(new Date())}`,
+      JSON.stringify({ history: historyRef.current, display }),
+    ).catch(console.error);
+  }, [display, stage, sending]);
+
   const send = async () => {
+    if (attachment) { analyzeAttachment(); return; }
     const text = input.trim();
     if (!text) return;
     setDisplay(prev => [...prev, { id: `u-${Date.now()}`, kind: 'user', text }]);
@@ -314,18 +426,36 @@ export default function DotChat() {
             {sending && <ActivityIndicator color={INK} style={{ marginTop: 4 }} />}
           </ScrollView>
 
+          {attachment && (
+            <View style={s.attachChip}>
+              <Paperclip size={11} color={INK} strokeWidth={1.5} />
+              <Text style={s.attachName} numberOfLines={1}>{attachment.name}</Text>
+              <TouchableOpacity onPress={() => setAttachment(null)} hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}>
+                <X size={11} color={MUTED} strokeWidth={1.5} />
+              </TouchableOpacity>
+            </View>
+          )}
+
           <View style={s.inputRow}>
+            <TouchableOpacity style={s.clipBtn} onPress={openPicker} activeOpacity={0.7}>
+              <Paperclip size={16} color={attachment ? INK : MUTED} strokeWidth={1.5} />
+            </TouchableOpacity>
             <TextInput
               style={s.input}
-              placeholder="Tell Dot what's on your mind..."
+              placeholder={attachment ? 'Describe what to do with this file…' : 'Tell Dot what\'s on your mind...'}
               placeholderTextColor={MUTED}
               value={input}
               onChangeText={setInput}
               onSubmitEditing={send}
               returnKeyType="send"
             />
-            <TouchableOpacity style={s.sendBtn} onPress={send} disabled={sending || !input.trim()} activeOpacity={0.8}>
-              <Text style={s.sendBtnTxt}>SEND</Text>
+            <TouchableOpacity
+              style={[s.sendBtn, (sending || analyzing || (!input.trim() && !attachment)) && { opacity: 0.4 }]}
+              onPress={send}
+              disabled={sending || analyzing || (!input.trim() && !attachment)}
+              activeOpacity={0.8}
+            >
+              {analyzing ? <ActivityIndicator color={BG} size="small" /> : <Text style={s.sendBtnTxt}>SEND</Text>}
             </TouchableOpacity>
           </View>
 
@@ -360,6 +490,13 @@ export default function DotChat() {
           </TouchableOpacity>
         </View>
       )}
+      <TaskPreviewModal
+        visible={showPreview}
+        tasks={suggestedTasks}
+        loading={false}
+        onConfirm={confirmTasks}
+        onCancel={() => setShowPreview(false)}
+      />
     </SafeAreaView>
   );
 }
@@ -382,9 +519,18 @@ const s = StyleSheet.create({
   addedRow:   { alignSelf: 'center', paddingVertical: 4 },
   addedTxt:   { fontFamily: 'PressStart2P', fontSize: 6, color: MUTED },
 
+  attachChip: {
+    flexDirection: 'row', alignItems: 'center', gap: 6,
+    marginHorizontal: 18, marginBottom: 6,
+    borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS,
+    paddingHorizontal: 10, paddingVertical: 6,
+  },
+  attachName: { flex: 1, fontFamily: 'VT323', fontSize: 14, color: INK },
+
   inputRow: { flexDirection: 'row', gap: 8, paddingHorizontal: 18, paddingTop: 10 },
+  clipBtn:  { width: 42, height: 42, alignItems: 'center', justifyContent: 'center', borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS },
   input:    { flex: 1, height: 42, borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, paddingHorizontal: 12, fontFamily: 'VT323', fontSize: 16, color: INK },
-  sendBtn:  { paddingHorizontal: 16, justifyContent: 'center', backgroundColor: INK, borderRadius: RADIUS },
+  sendBtn:  { height: 42, paddingHorizontal: 16, justifyContent: 'center', alignItems: 'center', backgroundColor: INK, borderRadius: RADIUS },
   sendBtnTxt: { fontFamily: 'PressStart2P', fontSize: 7, color: BG },
 
   lockBtn: { margin: 18, backgroundColor: INK, borderRadius: RADIUS, paddingVertical: 13, alignItems: 'center' },

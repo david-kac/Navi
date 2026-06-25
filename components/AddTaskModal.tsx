@@ -2,11 +2,16 @@ import React, { useRef, useState, useCallback, useEffect } from 'react';
 import {
   Modal, View, Text, TextInput, TouchableOpacity,
   StyleSheet, KeyboardAvoidingView, Platform, TouchableWithoutFeedback,
-  ScrollView, NativeSyntheticEvent, NativeScrollEvent,
+  ScrollView, NativeSyntheticEvent, NativeScrollEvent, Alert, ActivityIndicator,
 } from 'react-native';
-import { ChevronDown, RefreshCw, Clock, Calendar, Link } from 'lucide-react-native';
+import { ChevronDown, RefreshCw, Clock, Calendar, Paperclip, X } from 'lucide-react-native';
+import * as ImagePicker from 'expo-image-picker';
+import * as DocumentPicker from 'expo-document-picker';
+import * as FileSystem from 'expo-file-system';
 import { DEFAULT_CATEGORIES, Category, OPEN_CATEGORY_ID } from '../constants/categories';
 import InlineCalendar from './InlineCalendar';
+import { analyzeAssetAndSuggestTasks, SuggestedTask, AssetMimeType } from '../lib/ai';
+import TaskPreviewModal from './TaskPreviewModal';
 
 const INK    = '#2D2D2D';
 const BG     = '#FEFEFE';
@@ -23,7 +28,13 @@ const ITEM_H  = 44;
 const WEEK_DAYS = ['Mo','Tu','We','Th','Fr','Sa','Su'];
 
 type RepeatType = 'daily' | 'weekly' | 'monthly';
-type Panel = 'main' | 'category' | 'time' | 'date';
+type Panel = 'main' | 'category' | 'time' | 'date' | 'upload';
+
+interface AttachedFile {
+  base64: string;
+  mimeType: AssetMimeType;
+  name: string;
+}
 
 export interface NewTask {
   title:       string;
@@ -70,6 +81,7 @@ interface Props {
   onClose:      () => void;
   onAdd?:       (task: NewTask) => void;
   onSave?:      (id: string, task: NewTask) => void;
+  onAddMany?:   (tasks: SuggestedTask[]) => void;
   categories?:  CategoryOption[];
   editingTask?: EditableTask | null;
   initialDate?: string; // "YYYY-MM-DD", defaults to today when adding
@@ -239,7 +251,7 @@ const r = StyleSheet.create({
 });
 
 // ─── Main component ───────────────────────────────────────────────────────────
-export default function AddTaskModal({ visible, onClose, onAdd, onSave, categories, editingTask, initialDate }: Props) {
+export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMany, categories, editingTask, initialDate }: Props) {
   const options = categories && categories.length > 0 ? categories : DEFAULT_CATEGORIES;
 
   const [title,       setTitle]       = useState('');
@@ -257,6 +269,13 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, categori
   const [minute,  setMinute]  = useState('00');
   const [period,  setPeriod]  = useState<'AM' | 'PM'>('AM');
   const [timeSet, setTimeSet] = useState(false);
+
+  // Upload state
+  const [attachment,       setAttachment]       = useState<AttachedFile | null>(null);
+  const [uploadDesc,       setUploadDesc]       = useState('');
+  const [analyzing,        setAnalyzing]        = useState(false);
+  const [suggestedTasks,   setSuggestedTasks]   = useState<SuggestedTask[]>([]);
+  const [showPreview,      setShowPreview]      = useState(false);
 
   const selectedCat    = options.find(c => c.id === categoryId) ?? options[0];
   const startTimeLabel = timeSet ? `${hour}:${minute} ${period}` : '--:-- --';
@@ -309,6 +328,76 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, categori
     setRepeatType('daily'); setInterval('1'); setSelectedDays(new Set());
     setHour('08'); setMinute('00'); setPeriod('AM'); setTimeSet(false);
     setPanel('main');
+    setAttachment(null); setUploadDesc(''); setSuggestedTasks([]);
+  };
+
+  const pickPhoto = async () => {
+    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (status !== 'granted') {
+      Alert.alert('Permission needed', 'Allow photo library access in Settings to upload images.');
+      return;
+    }
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'],
+      base64: true,
+      quality: 0.7,
+    });
+    if (result.canceled || !result.assets[0]) return;
+    const asset = result.assets[0];
+    const mime: AssetMimeType = asset.mimeType === 'image/png' ? 'image/png' : 'image/jpeg';
+    setAttachment({ base64: asset.base64!, mimeType: mime, name: asset.fileName ?? 'image.jpg' });
+  };
+
+  const pickFile = async () => {
+    const result = await DocumentPicker.getDocumentAsync({
+      type: ['application/pdf', 'image/jpeg', 'image/png'],
+      copyToCacheDirectory: true,
+    });
+    if (result.canceled || !result.assets[0]) return;
+    const asset = result.assets[0];
+    const uri  = asset.uri;
+    const base64 = await FileSystem.readAsStringAsync(uri, { encoding: 'base64' as const });
+    const rawMime = asset.mimeType ?? '';
+    const mime: AssetMimeType = rawMime === 'application/pdf' ? 'application/pdf'
+      : rawMime === 'image/png' ? 'image/png' : 'image/jpeg';
+    setAttachment({ base64, mimeType: mime, name: asset.name });
+  };
+
+  const openPicker = () => {
+    Alert.alert('Upload File', 'Choose a source', [
+      { text: 'Photos',    onPress: pickPhoto },
+      { text: 'Files',     onPress: pickFile  },
+      { text: 'Cancel',    style: 'cancel'    },
+    ]);
+  };
+
+  const analyzeUpload = async () => {
+    if (!attachment) return;
+    setAnalyzing(true);
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      const catNames = options.filter(c => c.id !== OPEN_CATEGORY_ID).map(c => c.name);
+      const tasks = await analyzeAssetAndSuggestTasks({
+        fileBase64: attachment.base64,
+        mimeType:   attachment.mimeType,
+        description: uploadDesc.trim() || 'Extract all tasks from this document.',
+        today,
+        categoryNames: catNames,
+      });
+      setSuggestedTasks(tasks);
+      setShowPreview(true);
+    } catch (e) {
+      Alert.alert('Analysis failed', e instanceof Error ? e.message : 'Something went wrong.');
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  const confirmTasks = (tasks: SuggestedTask[]) => {
+    setShowPreview(false);
+    onAddMany?.(tasks);
+    reset();
+    onClose();
   };
 
   const handleClose = () => { reset(); onClose(); };
@@ -437,8 +526,8 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, categori
                   </View>
 
                   {/* Upload */}
-                  <TouchableOpacity style={s.uploadBtn} activeOpacity={0.7}>
-                    <Link size={13} color={INK} strokeWidth={1.5} />
+                  <TouchableOpacity style={s.uploadBtn} onPress={() => setPanel('upload')} activeOpacity={0.7}>
+                    <Paperclip size={13} color={INK} strokeWidth={1.5} />
                     <View style={{ flex: 1 }}>
                       <Text style={s.uploadTitle}>Upload file to extract tasks</Text>
                       <Text style={s.uploadSub}>PDF, JPG, PNG — workout plans, schedules, docs</Text>
@@ -518,8 +607,74 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, categori
             </>
           )}
 
+          {/* ── UPLOAD PANEL ── */}
+          {panel === 'upload' && (
+            <>
+              <View style={s.panelHeader}>
+                <Text style={s.header}>UPLOAD FILE</Text>
+                <TouchableOpacity onPress={() => { setPanel('main'); setAttachment(null); setUploadDesc(''); }} activeOpacity={0.7}>
+                  <Text style={s.backTxt}>← BACK</Text>
+                </TouchableOpacity>
+              </View>
+
+              {/* File picker area */}
+              <TouchableOpacity style={[s.uploadBtn, s.uploadBtnLg]} onPress={openPicker} activeOpacity={0.7}>
+                <Paperclip size={16} color={INK} strokeWidth={1.5} />
+                <View style={{ flex: 1 }}>
+                  {attachment
+                    ? <Text style={s.uploadTitle}>{attachment.name}</Text>
+                    : <Text style={s.uploadTitle}>Tap to choose a file</Text>}
+                  <Text style={s.uploadSub}>PDF, JPG, PNG</Text>
+                </View>
+                {attachment && (
+                  <TouchableOpacity onPress={() => setAttachment(null)} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                    <X size={13} color={MUTED} strokeWidth={1.5} />
+                  </TouchableOpacity>
+                )}
+              </TouchableOpacity>
+
+              {/* Description */}
+              <View style={{ gap: 6 }}>
+                <Text style={s.fieldLabel}>WHAT SHOULD DOT DO WITH IT?</Text>
+                <TextInput
+                  style={s.descInput}
+                  placeholder="e.g. Extract all tasks from this marathon training plan and schedule them starting next Monday"
+                  placeholderTextColor={MUTED}
+                  value={uploadDesc}
+                  onChangeText={setUploadDesc}
+                  multiline
+                  textAlignVertical="top"
+                />
+              </View>
+
+              <View style={s.btnRow}>
+                <TouchableOpacity
+                  style={[s.addBtn, (!attachment || analyzing) && { opacity: 0.4 }]}
+                  onPress={analyzeUpload}
+                  disabled={!attachment || analyzing}
+                  activeOpacity={0.8}
+                >
+                  {analyzing
+                    ? <ActivityIndicator color={BG} size="small" />
+                    : <Text style={s.addBtnTxt}>ANALYZE WITH DOT</Text>}
+                </TouchableOpacity>
+                <TouchableOpacity style={s.cancelBtn} onPress={() => { setPanel('main'); setAttachment(null); setUploadDesc(''); }} activeOpacity={0.7}>
+                  <Text style={s.cancelBtnTxt}>CANCEL</Text>
+                </TouchableOpacity>
+              </View>
+            </>
+          )}
+
         </View>
       </KeyboardAvoidingView>
+
+      <TaskPreviewModal
+        visible={showPreview}
+        tasks={suggestedTasks}
+        loading={false}
+        onConfirm={confirmTasks}
+        onCancel={() => setShowPreview(false)}
+      />
     </Modal>
   );
 }
@@ -587,6 +742,13 @@ const s = StyleSheet.create({
     flexDirection: 'row', alignItems: 'center', gap: 12,
     borderWidth: DASH, borderStyle: 'dashed', borderColor: INK,
     borderRadius: RADIUS, paddingHorizontal: 14, paddingVertical: 14,
+  },
+  uploadBtnLg: { paddingVertical: 18 },
+  descInput: {
+    height: 120,
+    borderWidth: BORDER, borderColor: INK, borderRadius: 2,
+    paddingHorizontal: 10, paddingTop: 10,
+    fontFamily: 'VT323', fontSize: 16, color: INK,
   },
   uploadTitle: { fontFamily: 'VT323', fontSize: 16, color: INK, lineHeight: 18 },
   uploadSub:   { fontFamily: 'PressStart2P', fontSize: 5, color: MUTED, lineHeight: 8, marginTop: 2 },

@@ -6,7 +6,9 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter, useFocusEffect } from 'expo-router';
 import DotCharacter, { DotMood } from '../components/DotCharacter';
+import PartyView from '../components/PartyView';
 import AddTaskModal, { NewTask, EditableTask } from '../components/AddTaskModal';
+import type { SuggestedTask } from '../lib/ai';
 import TaskActionSheet from '../components/TaskActionSheet';
 import CategoryActionSheet from '../components/CategoryActionSheet';
 import InlineCalendar from '../components/InlineCalendar';
@@ -159,14 +161,23 @@ function StatusRow({ time }: { time: string }) {
   );
 }
 
+const BANNER_ACTIVE   = require('../assets/Party Active.png');
+const BANNER_INACTIVE = require('../assets/Party inactive.png');
+
 // ─── Dot + action buttons ──────────────────────────────────────────────────────
-function DotHeader({ mood, onAdd, onOpenChat, onLongPressDot }: { mood: DotMood; onAdd: () => void; onOpenChat: () => void; onLongPressDot: () => void }) {
+function DotHeader({ mood, onAdd, onOpenChat, onLongPressDot, showParty, onToggleParty }: {
+  mood: DotMood; onAdd: () => void; onOpenChat: () => void; onLongPressDot: () => void;
+  showParty: boolean; onToggleParty: () => void;
+}) {
   return (
     <View style={s.dotHeader}>
       <TouchableOpacity onPress={onOpenChat} onLongPress={onLongPressDot} delayLongPress={600} activeOpacity={0.8}>
         <DotCharacter mood={mood} />
       </TouchableOpacity>
       <View style={s.dotBtns}>
+        <TouchableOpacity style={s.bannerBtn} onPress={onToggleParty} activeOpacity={0.7}>
+          <Image source={showParty ? BANNER_ACTIVE : BANNER_INACTIVE} style={s.bannerIcon} resizeMode="contain" />
+        </TouchableOpacity>
         <TouchableOpacity style={s.dotBtn} onPress={onAdd} activeOpacity={0.7}><Plus size={15} color={INK} strokeWidth={2} /></TouchableOpacity>
       </View>
     </View>
@@ -312,7 +323,10 @@ function RelaxRow() {
   return (
     <View style={s.relaxRow}>
       <Text style={s.relaxTxt}>TIME TO RELAX.</Text>
-      <DotCharacter mood="sleeping" />
+      {/* Negative margin cancels DotCharacter's hardcoded marginLeft: 16 */}
+      <View style={{ marginLeft: -20, marginTop: -8 }}>
+        <DotCharacter mood="sleeping" size={80} animated={false} />
+      </View>
     </View>
   );
 }
@@ -335,22 +349,17 @@ function WrapUpCard({ tasks, summary, loading }: { tasks: Task[]; summary: strin
 }
 
 // ─── Footer ────────────────────────────────────────────────────────────────────
-function Footer({ tasks, dayEnded, onEndDay, onBackToMorning, onRefresh }: {
+function Footer({ tasks, dayEnded, onEndDay, onBackToMorning }: {
   tasks: Task[]; dayEnded: boolean;
-  onEndDay: () => void; onBackToMorning: () => void; onRefresh: () => void;
+  onEndDay: () => void; onBackToMorning: () => void;
 }) {
   const left = tasks.filter(t => !t.isTTFO && !t.isCompleted).length;
   return (
     <View style={s.footer}>
       <Text style={s.footerCount}>{left} TASKS LEFT</Text>
-      <View style={s.footerRow}>
-        <TouchableOpacity style={s.endBtn} onPress={dayEnded ? onBackToMorning : onEndDay} activeOpacity={0.8}>
-          <Text style={s.endBtnTxt}>{dayEnded ? 'BACK TO MORNING' : 'END MY DAY'}</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={s.refreshBtn} onPress={onRefresh} activeOpacity={0.7}>
-          <RefreshCw size={14} color={INK} strokeWidth={1.5} />
-        </TouchableOpacity>
-      </View>
+      <TouchableOpacity style={s.endBtn} onPress={dayEnded ? onBackToMorning : onEndDay} activeOpacity={0.8}>
+        <Text style={s.endBtnTxt}>{dayEnded ? 'BACK TO MORNING' : 'END MY DAY'}</Text>
+      </TouchableOpacity>
     </View>
   );
 }
@@ -487,7 +496,13 @@ function CatsView({
                     <View style={s.accTaskContent}>
                       <Text style={[s.accTaskName, t.isCompleted && s.cardTitleDone]}>{t.title}</Text>
                       {(() => {
+                        const today = new Date(); today.setHours(0,0,0,0);
+                        const taskDate = new Date(t.date + 'T00:00:00');
+                        const dateLabel = taskDate.getTime() === today.getTime()
+                          ? 'Today'
+                          : taskDate.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
                         const parts = [
+                          dateLabel,
                           t.scheduledTime && fmt12(t.scheduledTime),
                           t.durationMins && `${t.durationMins}m`,
                         ].filter(Boolean);
@@ -592,6 +607,7 @@ export default function HomeScreen() {
   const [time,         setTime]        = useState(nowStr);
   const [tab,          setTab]         = useState<ActiveTab>('DAY');
   const [tasks,        setTasks]       = useState<Task[]>([]);
+  const [catTasks,     setCatTasks]    = useState<Task[]>([]);
   const [categories,   setCategories]  = useState<CategoryRow[]>([]);
   const [verse,        setVerse]       = useState<Verse | null>(null);
   const [showCal,      setShowCal]     = useState(false);
@@ -602,6 +618,7 @@ export default function HomeScreen() {
   const [selectedDate, setSelectedDate]= useState(new Date());
   const [actionTask,   setActionTask]  = useState<Task | null>(null);
   const [editingTask,  setEditingTask] = useState<Task | null>(null);
+  const [showParty,    setShowParty]   = useState(false);
 
   useEffect(() => {
     const id = setInterval(() => setTime(nowStr()), 30_000);
@@ -671,6 +688,7 @@ export default function HomeScreen() {
   const removeCategory = useCallback(async (id: string) => {
     setCategories(prev => prev.filter(c => c.id !== id));
     setTasks(prev => prev.map(t => t.categoryId === id ? { ...t, categoryId: null } : t));
+    setCatTasks(prev => prev.map(t => t.categoryId === id ? { ...t, categoryId: null } : t));
     const { error } = await supabase.from('categories').delete().eq('id', id);
     if (error) console.error(error);
   }, []);
@@ -736,25 +754,46 @@ export default function HomeScreen() {
     setTasks((data ?? []).map(rowToTask));
   }, [userId, selectedDate]);
 
+  // Load tasks for the next 30 days — used by the Categories tab so it shows
+  // upcoming tasks across all dates, not just the selected day.
+  const loadCatTasks = useCallback(async () => {
+    if (!userId) return;
+    const today = toISODate(new Date());
+    const end = new Date(); end.setDate(end.getDate() + 30);
+    const { data, error } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('user_id', userId)
+      .gte('date', today)
+      .lte('date', toISODate(end))
+      .order('date', { ascending: true })
+      .order('scheduled_time', { ascending: true });
+    if (error) { console.error(error); return; }
+    setCatTasks((data ?? []).map(rowToTask));
+  }, [userId]);
+
   useFocusEffect(
     useCallback(() => {
       loadCategories();
       loadWeekStats();
       loadTasks();
-    }, [loadCategories, loadWeekStats, loadTasks])
+      loadCatTasks();
+    }, [loadCategories, loadWeekStats, loadTasks, loadCatTasks])
   );
 
   const toggle = useCallback(async (id: string) => {
-    const target = tasks.find(t => t.id === id);
+    const target = tasks.find(t => t.id === id) ?? catTasks.find(t => t.id === id);
     if (!target) return;
     const nextCompleted = !target.isCompleted;
     setTasks(prev => prev.map(t => t.id === id ? { ...t, isCompleted: nextCompleted } : t));
+    setCatTasks(prev => prev.map(t => t.id === id ? { ...t, isCompleted: nextCompleted } : t));
     const { error } = await supabase.from('tasks').update({ is_completed: nextCompleted }).eq('id', id);
     if (error) console.error(error);
-  }, [tasks]);
+  }, [tasks, catTasks]);
 
   const remove = useCallback(async (id: string) => {
     setTasks(prev => prev.filter(t => t.id !== id));
+    setCatTasks(prev => prev.filter(t => t.id !== id));
     const { error } = await supabase.from('tasks').delete().eq('id', id);
     if (error) console.error(error);
   }, []);
@@ -762,6 +801,7 @@ export default function HomeScreen() {
   const removeOccurrence = useCallback(async (task: Task) => {
     if (!userId || !task.recurringRuleId) return;
     setTasks(prev => prev.filter(t => t.id !== task.id));
+    setCatTasks(prev => prev.filter(t => t.id !== task.id));
     await deleteRecurringOccurrence(userId, task.id, task.recurringRuleId, task.date);
   }, [userId]);
 
@@ -769,6 +809,7 @@ export default function HomeScreen() {
     if (!task.recurringRuleId) return;
     const ruleId = task.recurringRuleId;
     setTasks(prev => prev.filter(t => t.recurringRuleId !== ruleId));
+    setCatTasks(prev => prev.filter(t => t.recurringRuleId !== ruleId));
     await deleteRecurringSeries(ruleId);
   }, []);
 
@@ -789,6 +830,17 @@ export default function HomeScreen() {
       setTasks(prev => prev.map(t => t.id === id ? rowToTask(row) : t));
     } else {
       setTasks(prev => prev.filter(t => t.id !== id));
+    }
+    const today = toISODate(new Date());
+    const catEnd = new Date(); catEnd.setDate(catEnd.getDate() + 30);
+    if (row.date >= today && row.date <= toISODate(catEnd)) {
+      setCatTasks(prev =>
+        prev.some(t => t.id === id)
+          ? prev.map(t => t.id === id ? rowToTask(row) : t)
+          : [...prev, rowToTask(row)]
+      );
+    } else {
+      setCatTasks(prev => prev.filter(t => t.id !== id));
     }
   }, [selectedDate]);
 
@@ -836,7 +888,43 @@ export default function HomeScreen() {
     if (row.date === toISODate(selectedDate)) {
       setTasks(prev => [...prev, rowToTask(row)]);
     }
+    const today = toISODate(new Date());
+    const catEnd = new Date(); catEnd.setDate(catEnd.getDate() + 30);
+    if (row.date >= today && row.date <= toISODate(catEnd)) {
+      setCatTasks(prev => [...prev, rowToTask(row)]);
+    }
   }, [userId, selectedDate]);
+
+  const addTasks = useCallback(async (suggested: SuggestedTask[]) => {
+    if (!userId) return;
+    const today = toISODate(new Date());
+    const catEnd = new Date(); catEnd.setDate(catEnd.getDate() + 30);
+    for (const s of suggested) {
+      const matchedCat = categories.find(c => c.name.toLowerCase() === s.categoryName?.toLowerCase());
+      const scheduledTime = s.scheduledTime ? `${s.scheduledTime}:00` : null;
+      const date = s.date ?? today;
+      const { data: row, error } = await supabase
+        .from('tasks')
+        .insert({
+          user_id:           userId,
+          title:             s.title,
+          category_id:       matchedCat?.id ?? null,
+          date,
+          scheduled_time:    scheduledTime,
+          duration_minutes:  s.durationMinutes ?? null,
+          time_period:       getTimePeriod(scheduledTime),
+        })
+        .select('*')
+        .single();
+      if (error || !row) { console.error(error); continue; }
+      if (row.date === toISODate(selectedDate)) {
+        setTasks(prev => [...prev, rowToTask(row)]);
+      }
+      if (row.date >= today && row.date <= toISODate(catEnd)) {
+        setCatTasks(prev => [...prev, rowToTask(row)]);
+      }
+    }
+  }, [userId, categories, selectedDate]);
 
   const byPeriod = (p: TimePeriod) => tasks.filter(t => t.timePeriod === p && !t.isTTFO);
   const ttfo        = tasks.filter(t => t.isTTFO);
@@ -864,16 +952,20 @@ export default function HomeScreen() {
     <SafeAreaView style={s.root}>
       {/* ── Fixed header ── */}
       <DotHeader
-        mood={allComplete ? 'sleeping' : 'happy'}
+        mood="happy"
         onAdd={() => setShowAddTask(true)}
         onOpenChat={() => router.push('/dot-chat')}
         onLongPressDot={() => router.push('/settings')}
+        showParty={showParty}
+        onToggleParty={() => setShowParty(v => !v)}
       />
       <View style={s.divider} />
       <VerseCard verse={verse} />
 
       {/* ── Content ── */}
-      {tab === 'DAY' && (
+      {showParty ? (
+        <PartyView userId={userId} />
+      ) : tab === 'DAY' && (
         <ScrollView style={s.tabContent} showsVerticalScrollIndicator={false}>
           <View style={s.todoWrap}><Text style={s.todoText}>TO-DO</Text></View>
           <TabBar active={tab} onChange={t => { setTab(t); setShowCal(false); }} />
@@ -907,18 +999,17 @@ export default function HomeScreen() {
             dayEnded={dayEnded}
             onEndDay={endDay}
             onBackToMorning={() => setDayEnded(false)}
-            onRefresh={() => { loadTasks(); setDayEnded(false); }}
           />
           <View style={{ height: 32 }} />
         </ScrollView>
       )}
-      {tab === 'WEEK' && <WeekView tab={tab} onTabChange={t => { setTab(t); setShowCal(false); }} weekCats={weekCats} />}
-      {tab === 'CATS' && (
+      {!showParty && tab === 'WEEK' && <WeekView tab={tab} onTabChange={t => { setTab(t); setShowCal(false); }} weekCats={weekCats} />}
+      {!showParty && tab === 'CATS' && (
         <CatsView
           tab={tab}
           onTabChange={t => { setTab(t); setShowCal(false); }}
           categories={categoriesWithOpen}
-          tasks={tasks}
+          tasks={catTasks}
           onToggleTask={toggle}
           onLongPressTask={setActionTask}
           onAddTask={(categoryId, title) => addTask({ title, categoryId, date: toISODate(selectedDate), startTime: '', duration: '', isRecurring: false })}
@@ -933,6 +1024,7 @@ export default function HomeScreen() {
         onClose={() => { setShowAddTask(false); setEditingTask(null); }}
         onAdd={addTask}
         onSave={(id, nt) => updateTask(id, nt)}
+        onAddMany={addTasks}
         categories={categoriesWithOpen}
         initialDate={toISODate(selectedDate)}
         editingTask={editingTask ? {
@@ -981,6 +1073,8 @@ const s = StyleSheet.create({
   dotHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: MARGIN, paddingTop: 6, paddingBottom: 6 },
   dotBtns:   { flexDirection: 'row', gap: 6 },
   dotBtn:    { width: 36, height: 36, borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, alignItems: 'center', justifyContent: 'center', backgroundColor: BG },
+  bannerIcon: { width: 30, height: 30 },
+  bannerBtn:  { width: 36, height: 36, alignItems: 'center', justifyContent: 'center', marginRight: 8 },
 
   divider:     { height: DASH, backgroundColor: INK },
   tabUnderline:{ height: DASH, backgroundColor: INK, marginTop: 10 },
@@ -1039,7 +1133,7 @@ const s = StyleSheet.create({
   ttfoCount: { fontFamily: 'PressStart2P', fontSize: 6, color: MUTED, lineHeight: 9 },
 
   // All-complete
-  relaxRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingVertical: 20, gap: 16 },
+  relaxRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingVertical: 20, gap: 8 },
   relaxTxt: { fontFamily: 'PressStart2P', fontSize: 8, color: INK, lineHeight: 14 },
 
   // Wrap-up card

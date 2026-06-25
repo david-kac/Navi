@@ -434,3 +434,37 @@ On first launch, a hidden settings screen (accessible via long-press on Dot) pro
 **Unresolved / open items for next session:**
 - Voice input, separate Week/Categories/End-of-Day/Calendar routes, `DotCharacter` thinking/excited sprites, marathon-training-plan-specific recurring logic — all still open from the previous session, untouched this session.
 - `CatsView`'s task list (and therefore the Categories tab) is still scoped to `selectedDate` only, same as the Day tab — a task only shows under its category if it falls on the currently-selected day. Not addressed this session; worth revisiting if Categories is meant to show an all-time view.
+
+### 2026-06-25 — Party screen, asset upload, chat persistence, and UX polish
+
+**Completed this session:**
+
+1. **Categories tab 30-day window**: `catTasks` state added to `app/index.tsx` with its own `loadCatTasks()` fetching the next 30 days — `CatsView` now shows all upcoming tasks per category, not just `selectedDate`. Date labels added to task sub-lines ("Today" for today, otherwise day/month abbreviation). All mutations (`toggle`, `remove`, `updateTask`, `addTask`, `removeCategory`) update both `tasks` and `catTasks`.
+
+2. **Chat history persistence**: `app/dot-chat.tsx` saves `{ history, display }` to `AsyncStorage` under key `dot_chat_YYYY-MM-DD` after every send. On re-open, `greet()` restores the saved history if today's key exists, skipping the greeting entirely. Clears on next calendar day.
+
+3. **End-of-day UI**: `DotHeader` mood hardcoded to `"happy"` always (no longer switches to sleeping). `DotCharacter` gains `size` and `animated` props; `RelaxRow` uses `size={80} animated={false}` with `marginLeft: -20, marginTop: -8` wrapper to counteract the component's internal `marginLeft: 16`. Refresh button removed from `Footer`.
+
+4. **Asset upload in AddTaskModal + chat**: New `'upload'` panel in `AddTaskModal` with `expo-image-picker` + `expo-document-picker` file picker, description textarea, and "ANALYZE WITH DOT" button. Calls `analyzeAssetAndSuggestTasks()` in `lib/ai.ts` (handles image vs PDF content blocks, `anthropic-beta: pdfs-2024-09-25` for PDFs). Paperclip icon added to chat input in `dot-chat.tsx` for the same flow. Both routes surface a `TaskPreviewModal` (new `components/TaskPreviewModal.tsx`) for reviewing suggested tasks before creating them. `app/index.tsx` gains `addTasks()` for bulk task creation from suggestions.
+   - Key fix: `s.textInput` has `flex: 1` which collapses TextInput height inside non-flex parents — description box needed its own `s.descInput` style with explicit `height: 120` and no `flex`.
+   - Key fix: `FileSystem.readAsStringAsync(uri, { encoding: 'base64' as const })` — `EncodingType.Base64` not exported from `expo-file-system` top-level in this SDK version.
+
+5. **Party screen** (`components/PartyView.tsx`, `components/AddFriendModal.tsx`):
+   - Supabase migration `20260625000000_party_tables.sql`: `friends` + `contact_logs` tables with per-operation RLS policies. Pushed live via `supabase db push`. 5 test friends seeded (SARAH/MARCUS/JAMIE/ALEX/RILEY) with contact logs giving a spread of HP values.
+   - HP formula: VISIT=90, CALL=75, MSG=25, capped at 100, rolling 30-day window. Sprite: `Great.png` (≥75), `Good.png` (25–74), `Reach out.png` (<25).
+   - Party toggle: shield banner in `DotHeader` (left of `+`), `showParty` state in `app/index.tsx` — conditionally renders `PartyView` in place of tab content.
+   - Expanded drawer: `#F8F8F8` background; dashed lines above and below implemented as `<DashedLine />` segment-based component (RN's `borderStyle: 'dashed'` with directional borders is broken on iOS — requires `borderWidth` all sides).
+   - Contact row long-press → `Alert` with "Change to VISIT/CALL/MSG" + "Delete log" (destructive). Silent refresh (`loadData(true)`) keeps drawer open after any action.
+   - `+ LOG CONTACT` moved to bottom of expanded drawer; `remove member` right-aligned opposite it.
+   - "add party member" text button + `+` right-aligned in title row (left = "Party" heading).
+   - `AddFriendModal`: bottom-sheet style, name auto-uppercased, ADD/CANCEL buttons.
+
+**Key technical notes:**
+- `borderStyle: 'dashed'` in React Native only works with `borderWidth` (all 4 sides), NOT with directional borders (`borderTopWidth`, etc.) on iOS. Use a segment-based `DashedLine` component for horizontal dashed separators.
+- `loadData(silent = false)`: pass `true` for background refreshes to avoid `setLoading(true)` → unmount → state loss on expanded drawers.
+- `DotCharacter` has hardcoded `marginLeft: 16` internally — counteract with negative margin on the wrapper when used in non-header contexts.
+
+**Unresolved / open items for next session:**
+- Voice input (`VoiceModal`, `expo-speech`), separate route files for Week/Categories/End-of-Day/Calendar, `DotCharacter` `thinking`/`excited` sprites, marathon-training-plan recurring logic — all still open.
+- Party screen has no "edit friend name" capability.
+- Asset upload not tested end-to-end on device (requires camera roll permissions and a real API call with a file).
