@@ -468,3 +468,36 @@ On first launch, a hidden settings screen (accessible via long-press on Dot) pro
 - Voice input (`VoiceModal`, `expo-speech`), separate route files for Week/Categories/End-of-Day/Calendar, `DotCharacter` `thinking`/`excited` sprites, marathon-training-plan recurring logic — all still open.
 - Party screen has no "edit friend name" capability.
 - Asset upload not tested end-to-end on device (requires camera roll permissions and a real API call with a file).
+
+### 2026-07-05/06 — Chat parity, evening wrap-up, dateless tasks, and UX polish
+
+**Session 1 — bug fixes + backlog items (8 of 9 requested; math-problem-of-the-day skipped, needs a design discussion):**
+
+1. **PDF upload fixed**: `analyzeAssetAndSuggestTasks()` in `lib/ai.ts` was sending `anthropic-beta: pdfs-2024-09-25` — a retired early-access beta flag. Base64 PDF document blocks are GA and need no beta header; removed it. This was the likely root cause behind both the PDF-upload and chat-attachment items on the backlog (chat's attachment flow itself already matched `AddTaskModal`'s working pattern — no separate bug found there).
+2. **Chat move/delete made robust**: `update_task`/`delete_task` tool calls require Claude to copy an exact task uuid from the system prompt; a mistyped id silently failed lookups. Added a `resolveTaskId()` fallback in `app/dot-chat.tsx` that matches by `currentTitle` (+ `currentDate` to disambiguate) when the direct id lookup misses. Both tool schemas in `lib/ai.ts` now request `currentTitle`/`currentDate` as fallback fields.
+3. **Chat/task-modal parity closed**: `update_task` gained `categoryName` (move category), `clearScheduledTime`/`clearDate` (unschedule / de-date a task via chat); `add_task` gained `isRecurring`/`ruleType`/`daysOfWeek` (chat can now create recurring tasks, mirroring `AddTaskModal`'s repeat section — `executeAddTask` creates the `recurring_task_rules` row itself, same pattern as `app/index.tsx`'s `addTask`).
+4. **End-of-day overhauled into a real conversation**: new `evening` session mode in `app/dot-chat.tsx` (routed via `/dot-chat?mode=evening`) replaces the old static `WrapUpCard`/`generateEndOfDaySummary` one-shot call (both deleted from `lib/ai.ts` and `app/index.tsx`). Dot summarizes done/missed/undecided from `formatEodBreakdown()` and negotiates what to do with unfinished tasks using the existing `update_task`/`delete_task` tools. Own `AsyncStorage` key (`dot_chat_<date>_evening`) so it doesn't collide with the daily morning/anytime chat. Footer's `END MY DAY` now just navigates there.
+5. **Categories are now editable**: `CategoryActionSheet` gained an `onEdit` prop/button (`canModify` replaces `canDelete`); `CatsView` in `app/index.tsx` shows an inline rename/re-icon form (same visual pattern as "+ NEW CATEGORY"). New `updateCategory()` in `HomeScreen`. Open category still can't be edited or deleted (no real row to mutate).
+6. **Tasks can now have no date at all**, independent of no time. Required `alter table public.tasks alter column date drop not null` (migration `20260701000000_nullable_task_date.sql`, pushed live) plus updating `lib/database.types.ts`'s `tasks.date` to `string | null` by hand (types weren't regenerated from the CLI). `app/index.tsx` gained an `inCatWindow()` helper so dateless tasks still surface in the Categories tab (the `.or('date.is.null,and(date.gte...,date.lte...)')` Supabase filter) since Day view is inherently per-date and can't show them.
+7. **AddTaskModal gained an END TIME picker** (mirrors the existing START TIME picker) that auto-computes `duration` from the start/end gap; editing a task with both a time and duration pre-fills the end-time picker to match. DATE field gained a clear-date `X` button plus a "CLEAR DATE" button inside the date panel itself (must be wrapped in `s.btnRow` like every other cancel/clear button in the file — a standalone `flex:1` button outside that row rendered with no visible text, a real bug hit and fixed mid-session).
+8. **Task cards show computed end time**: `timeLabel()` helper in `app/index.tsx` (used by both the Day-tab `TaskCard` and the Categories accordion) now returns `"7:00 AM - 7:30 AM"` when both a start time and duration are known, instead of `"7:00 AM · 30m"`.
+
+**Session 2 — smaller UX requests:**
+
+9. **WEEK tab removed entirely** (`app/index.tsx`): `WeekView`, `weekCats` state, `loadWeekStats`, `mondayOf`, `WEEK_TOTAL`, `WeekCatStat`, and the `WEEK` member of `ActiveTab`/`TABS` all deleted. David never used it.
+10. **Chat auto-scroll**: `dot-chat.tsx`'s `ScrollView` now uses `onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: true })}` instead of a single manual `setTimeout` scroll call after `send()` — fixes both "chat opens showing the middle/top" and "doesn't follow new messages" (tool-added messages, restored history, and the greeting all trigger it too, not just user-sent turns).
+11. **Category edit form scrolls into view**: `CatsView` gained a `scrollRef` + a `useEffect` on `editingCatId` that calls `scrollToEnd` — the inline edit form renders near the bottom of the list and was invisible without this when the scroll position hadn't moved.
+12. **Open time slots (informational only, not tappable)**: `AddTaskModal` computes free gaps (6am–11pm window, tasks without a duration assumed 30 min) for whichever date is currently selected in its own date picker, via a new `existingTasks: DayTaskSlot[]` prop — `app/index.tsx` passes a slim projection of `catTasks` (`existingTaskSlots`, memoized). Shows nothing when no date is set; David explicitly didn't want tap-to-fill.
+13. **Duration always appended**: `timeLabel()` now returns `"7:00 AM - 7:30 AM · 30m"` (was previously dropping the explicit `· 30m` once a range was computable).
+
+**Also this session:** EAS production build #11 built + submitted to TestFlight (`eas build -p ios --profile production --submit`).
+
+**Key technical notes:**
+- Old/retired Anthropic beta headers can silently break requests once retired — don't assume a header from a previous session is still valid without checking current docs.
+- A `TouchableOpacity` using the shared `cancelBtn` style (`flex: 1`) must be inside a `flexDirection: 'row'` wrapper (`s.btnRow`) — standalone outside a row, its text failed to render.
+- `.or('date.is.null,and(date.gte.X,date.lte.Y)')` is the Supabase/PostgREST pattern for "nullable column OR within a range" — plain `.gte()/.lte()` silently excludes NULLs.
+
+**Unresolved / open items for next session:**
+- Voice input, separate Week*/Categories/End-of-Day/Calendar routes (*now moot — Week removed), `DotCharacter` thinking/excited sprites, marathon-training-plan recurring logic, Party screen edit-friend-name — all still open, untouched this session.
+- Math problem of the day (feather-quill icon, calculus MCQ) — deliberately not started; needs a design discussion on where problems come from before implementation.
+- New end-time picker, open-slots display, and evening wrap-up flow have not been tested end-to-end on a physical device/simulator (no iOS environment available in the working session) — worth a manual pass after installing build #11.
