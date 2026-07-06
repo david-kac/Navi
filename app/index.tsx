@@ -1,13 +1,13 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity,
-  StyleSheet, Image, TextInput, ActivityIndicator,
+  StyleSheet, Image, TextInput,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter, useFocusEffect } from 'expo-router';
 import DotCharacter, { DotMood } from '../components/DotCharacter';
 import PartyView from '../components/PartyView';
-import AddTaskModal, { NewTask, EditableTask } from '../components/AddTaskModal';
+import AddTaskModal, { NewTask, EditableTask, DayTaskSlot } from '../components/AddTaskModal';
 import type { SuggestedTask } from '../lib/ai';
 import TaskActionSheet from '../components/TaskActionSheet';
 import CategoryActionSheet from '../components/CategoryActionSheet';
@@ -18,7 +18,6 @@ import { useAuth } from '../lib/AuthProvider';
 import type { Database } from '../lib/database.types';
 import { getTimePeriod } from '../lib/database.types';
 import { generateTasksForDate, deleteRecurringOccurrence, deleteRecurringSeries } from '../lib/recurring';
-import { generateEndOfDaySummary } from '../lib/ai';
 import { shouldShowMorningFlow } from '../lib/morningGate';
 import { getVerseOfTheDay, Verse } from '../lib/verseOfTheDay';
 
@@ -44,13 +43,13 @@ const MARGIN = 18;
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 type TimePeriod = 'morning' | 'afternoon' | 'evening' | 'unscheduled';
-type ActiveTab  = 'DAY' | 'WEEK' | 'CATS';
+type ActiveTab  = 'DAY' | 'CATS';
 
 interface Task {
   id:             string;
   title:          string;
   categoryId:     string | null;
-  date:           string;
+  date:           string | null;
   recurringRuleId: string | null;
   scheduledTime?: string;
   durationMins?:  number;
@@ -84,6 +83,13 @@ function toISODate(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
+// A dateless task always belongs in the Categories tab's 30-day window (it
+// has no date to fall outside of); a dated task only belongs if it falls
+// within the window.
+function inCatWindow(date: string | null, todayISO: string, catEndISO: string): boolean {
+  return date === null || (date >= todayISO && date <= catEndISO);
+}
+
 // Converts AddTaskModal's "08:00 AM" label to a Postgres `time` literal.
 function to24Hour(label: string): string | null {
   const match = label.match(/^(\d{2}):(\d{2}) (AM|PM)$/);
@@ -92,20 +98,6 @@ function to24Hour(label: string): string | null {
   if (match[3] === 'PM' && h !== 12) h += 12;
   if (match[3] === 'AM' && h === 12) h = 0;
   return `${h.toString().padStart(2, '0')}:${match[2]}:00`;
-}
-
-// ─── Week view data ─────────────────────────────────────────────────────────────
-const WEEK_TOTAL = 168;
-
-interface WeekCatStat { id: string; name: string; icon: string; hrs: number }
-
-function mondayOf(d: Date): Date {
-  const date = new Date(d);
-  const dow = date.getDay(); // 0=Sun..6=Sat
-  const diff = dow === 0 ? -6 : 1 - dow;
-  date.setDate(date.getDate() + diff);
-  date.setHours(0, 0, 0, 0);
-  return date;
 }
 
 // ─── Icon grid for new category ─────────────────────────────────────────────────
@@ -121,6 +113,20 @@ function fmt12(t: string) {
   const ap = h >= 12 ? 'PM' : 'AM';
   const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
   return `${h12}:${m.toString().padStart(2,'0')} ${ap}`;
+}
+
+// When a task has both a start time and a duration, show the computed end
+// time ("7:00 AM - 7:30 AM") instead of a separate duration chip. Falls back
+// to just the start time, or just the duration, when only one is set.
+function timeLabel(scheduledTime?: string, durationMins?: number): string | null {
+  if (!scheduledTime) return durationMins ? `${durationMins}m` : null;
+  if (!durationMins) return fmt12(scheduledTime);
+  const [h, m] = scheduledTime.split(':').map(Number);
+  const endTotal = (h * 60 + m + durationMins) % (24 * 60);
+  const endH = Math.floor(endTotal / 60);
+  const endM = endTotal % 60;
+  const endStr = `${endH.toString().padStart(2, '0')}:${endM.toString().padStart(2, '0')}`;
+  return `${fmt12(scheduledTime)} - ${fmt12(endStr)} · ${durationMins}m`;
 }
 
 function nowStr() {
@@ -185,7 +191,7 @@ function DotHeader({ mood, onAdd, onOpenChat, onLongPressDot, showParty, onToggl
 }
 
 // ─── Tab bar ───────────────────────────────────────────────────────────────────
-const TABS: ActiveTab[] = ['DAY', 'WEEK', 'CATS'];
+const TABS: ActiveTab[] = ['DAY', 'CATS'];
 
 function TabBar({ active, onChange }: { active: ActiveTab; onChange: (t: ActiveTab) => void }) {
   return (
@@ -261,11 +267,7 @@ function SectionHeader({ title }: { title: string }) {
 
 // ─── Task card ─────────────────────────────────────────────────────────────────
 function TaskCard({ task, icon, onToggle, onLongPress }: { task: Task; icon: string; onToggle: (id: string) => void; onLongPress: (task: Task) => void }) {
-  const subParts = [
-    task.scheduledTime && fmt12(task.scheduledTime),
-    task.durationMins && `${task.durationMins}m`,
-  ].filter(Boolean);
-  const sub = subParts.length ? subParts.join(' · ') : null;
+  const sub = timeLabel(task.scheduledTime, task.durationMins);
   return (
     <TouchableOpacity
       style={[s.card, task.isCompleted && s.cardFaded]}
@@ -331,83 +333,16 @@ function RelaxRow() {
   );
 }
 
-// ─── Wrap-up card (end of day) ─────────────────────────────────────────────────
-function WrapUpCard({ tasks, summary, loading }: { tasks: Task[]; summary: string | null; loading: boolean }) {
-  const done  = tasks.filter(t => !t.isTTFO && t.isCompleted).length;
-  const total = tasks.filter(t => !t.isTTFO).length;
-  return (
-    <View style={s.wrapCard}>
-      <Text style={s.wrapLabel}>WRAP-UP</Text>
-      <Text style={s.wrapHeadline}>{done} of {total} done.</Text>
-      {loading
-        ? <ActivityIndicator color={INK} style={{ alignSelf: 'flex-start', marginTop: 4 }} />
-        : summary
-          ? <Text style={s.wrapPreview}>{summary}</Text>
-          : null}
-    </View>
-  );
-}
-
 // ─── Footer ────────────────────────────────────────────────────────────────────
-function Footer({ tasks, dayEnded, onEndDay, onBackToMorning }: {
-  tasks: Task[]; dayEnded: boolean;
-  onEndDay: () => void; onBackToMorning: () => void;
-}) {
+function Footer({ tasks, onEndDay }: { tasks: Task[]; onEndDay: () => void }) {
   const left = tasks.filter(t => !t.isTTFO && !t.isCompleted).length;
   return (
     <View style={s.footer}>
       <Text style={s.footerCount}>{left} TASKS LEFT</Text>
-      <TouchableOpacity style={s.endBtn} onPress={dayEnded ? onBackToMorning : onEndDay} activeOpacity={0.8}>
-        <Text style={s.endBtnTxt}>{dayEnded ? 'BACK TO MORNING' : 'END MY DAY'}</Text>
+      <TouchableOpacity style={s.endBtn} onPress={onEndDay} activeOpacity={0.8}>
+        <Text style={s.endBtnTxt}>END MY DAY</Text>
       </TouchableOpacity>
     </View>
-  );
-}
-
-// ─── Week View ─────────────────────────────────────────────────────────────────
-function WeekView({ tab, onTabChange, weekCats }: { tab: ActiveTab; onTabChange: (t: ActiveTab) => void; weekCats: WeekCatStat[] }) {
-  const totalHrs = weekCats.reduce((sum, c) => sum + c.hrs, 0);
-  const margin   = WEEK_TOTAL - totalHrs;
-  const maxHrs   = Math.max(1, ...weekCats.map(c => c.hrs));
-
-  return (
-    <ScrollView style={s.tabContent} showsVerticalScrollIndicator={false}>
-      <View style={s.todoWrap}><Text style={s.todoText}>TO-DO</Text></View>
-      <TabBar active={tab} onChange={onTabChange} />
-      <View style={s.weekHead}>
-        <Text style={s.weekHeadLabel}>HOURS THIS WEEK</Text>
-      </View>
-
-      {/* Summary card */}
-      <View style={s.weekSummary}>
-        <Text style={s.weekSummaryTxt}>
-          {totalHrs.toFixed(1)} of {WEEK_TOTAL} hrs blocked{'  ·  '}~{margin.toFixed(1)} hrs margin
-        </Text>
-      </View>
-
-      {/* Category rows */}
-      {weekCats.map(cat => {
-        const pct = (cat.hrs / maxHrs) * 100;
-        return (
-          <View key={cat.id} style={s.weekCatCard}>
-            <View style={s.weekCatHeader}>
-              <NamedIcon name={cat.icon} size={12} color={INK} />
-              <Text style={s.weekCatName}>{cat.name}</Text>
-              <View style={{ flex: 1 }} />
-              <Text style={s.weekCatHrs}>{cat.hrs.toFixed(1)} HRS</Text>
-            </View>
-            <View style={s.weekBarTrack}>
-              <View style={[s.weekBarFill, { width: `${pct.toFixed(0)}%` as any }]} />
-            </View>
-          </View>
-        );
-      })}
-      {weekCats.length === 0 && (
-        <Text style={s.weekFootnote}>No timed tasks scheduled this week yet.</Text>
-      )}
-
-      <View style={{ height: 32 }} />
-    </ScrollView>
   );
 }
 
@@ -421,12 +356,13 @@ interface CatsViewProps {
   onLongPressTask: (task: Task) => void;
   onAddTask: (categoryId: string, title: string) => void;
   onAddCategory: (name: string, icon: string) => void;
+  onEditCategory: (id: string, name: string, icon: string) => void;
   onDeleteCategory: (id: string) => void;
 }
 
 function CatsView({
   tab, onTabChange, categories, tasks,
-  onToggleTask, onLongPressTask, onAddTask, onAddCategory, onDeleteCategory,
+  onToggleTask, onLongPressTask, onAddTask, onAddCategory, onEditCategory, onDeleteCategory,
 }: CatsViewProps) {
   const [expanded,    setExpanded]    = useState<Set<string>>(new Set());
   const [showNew,     setShowNew]     = useState(false);
@@ -435,6 +371,20 @@ function CatsView({
   const [draftTitles, setDraftTitles] = useState<Record<string, string>>({});
   const [categoryActionId, setCategoryActionId] = useState<string | null>(null);
   const categoryAction = categories.find(c => c.id === categoryActionId) ?? null;
+
+  const [editingCatId, setEditingCatId] = useState<string | null>(null);
+  const [editName,     setEditName]     = useState('');
+  const [editIcon,     setEditIcon]     = useState(0);
+
+  const scrollRef = useRef<ScrollView>(null);
+  // The edit form renders near the bottom of the list — jump the scroll
+  // there when it opens so it's actually visible instead of requiring a
+  // manual scroll down from wherever the list happened to be.
+  useEffect(() => {
+    if (editingCatId) {
+      setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 50);
+    }
+  }, [editingCatId]);
 
   const toggleExpanded = (id: string) => setExpanded(prev => {
     const next = new Set(prev);
@@ -450,7 +400,7 @@ function CatsView({
   };
 
   return (
-    <ScrollView style={s.tabContent} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+    <ScrollView ref={scrollRef} style={s.tabContent} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
       <View style={s.todoWrap}><Text style={s.todoText}>TO-DO</Text></View>
       <TabBar active={tab} onChange={onTabChange} />
       <View style={s.catsHead}><Text style={s.catsHeadLabel}>CATEGORIES</Text></View>
@@ -496,15 +446,17 @@ function CatsView({
                     <View style={s.accTaskContent}>
                       <Text style={[s.accTaskName, t.isCompleted && s.cardTitleDone]}>{t.title}</Text>
                       {(() => {
-                        const today = new Date(); today.setHours(0,0,0,0);
-                        const taskDate = new Date(t.date + 'T00:00:00');
-                        const dateLabel = taskDate.getTime() === today.getTime()
-                          ? 'Today'
-                          : taskDate.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+                        let dateLabel: string | null = null;
+                        if (t.date) {
+                          const today = new Date(); today.setHours(0,0,0,0);
+                          const taskDate = new Date(t.date + 'T00:00:00');
+                          dateLabel = taskDate.getTime() === today.getTime()
+                            ? 'Today'
+                            : taskDate.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+                        }
                         const parts = [
-                          dateLabel,
-                          t.scheduledTime && fmt12(t.scheduledTime),
-                          t.durationMins && `${t.durationMins}m`,
+                          dateLabel ?? 'No date',
+                          timeLabel(t.scheduledTime, t.durationMins),
                         ].filter(Boolean);
                         return parts.length ? <Text style={s.accTaskSub}>{parts.join(' · ')}</Text> : null;
                       })()}
@@ -534,13 +486,15 @@ function CatsView({
       })}
 
       {/* + NEW CATEGORY */}
-      <TouchableOpacity style={s.newCatTrigger} onPress={() => setShowNew(!showNew)} activeOpacity={0.7}>
-        <Plus size={12} color={INK} strokeWidth={2} />
-        <Text style={s.newCatTriggerTxt}>+ NEW CATEGORY</Text>
-      </TouchableOpacity>
+      {!editingCatId && (
+        <TouchableOpacity style={s.newCatTrigger} onPress={() => setShowNew(!showNew)} activeOpacity={0.7}>
+          <Plus size={12} color={INK} strokeWidth={2} />
+          <Text style={s.newCatTriggerTxt}>+ NEW CATEGORY</Text>
+        </TouchableOpacity>
+      )}
 
       {/* New category form */}
-      {showNew && (
+      {showNew && !editingCatId && (
         <View style={s.newCatCard}>
           <Text style={s.newCatLabel}>NEW CATEGORY</Text>
           <TextInput
@@ -582,13 +536,65 @@ function CatsView({
         </View>
       )}
 
+      {/* Edit category form */}
+      {editingCatId && (
+        <View style={s.newCatCard}>
+          <Text style={s.newCatLabel}>EDIT CATEGORY</Text>
+          <TextInput
+            style={s.newCatInput}
+            placeholder="Category name..."
+            placeholderTextColor={MUTED}
+            value={editName}
+            onChangeText={setEditName}
+          />
+          <Text style={s.newCatIconLabel}>CHOOSE ICON</Text>
+          <View style={s.iconGrid}>
+            {CAT_ICON_GRID.map((icon, i) => (
+              <TouchableOpacity
+                key={icon}
+                style={[s.iconGridBtn, editIcon === i && s.iconGridBtnOn]}
+                onPress={() => setEditIcon(i)}
+                activeOpacity={0.7}
+              >
+                <NamedIcon name={icon} size={16} color={editIcon === i ? BG : INK} />
+              </TouchableOpacity>
+            ))}
+          </View>
+          <View style={s.newCatActions}>
+            <TouchableOpacity
+              style={s.newCatAdd}
+              onPress={() => {
+                if (!editName.trim() || !editingCatId) return;
+                onEditCategory(editingCatId, editName.trim(), CAT_ICON_GRID[editIcon]);
+                setEditingCatId(null);
+              }}
+              activeOpacity={0.8}
+            >
+              <Text style={s.newCatAddTxt}>SAVE</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={s.newCatClose} onPress={() => setEditingCatId(null)} activeOpacity={0.7}>
+              <X size={14} color={INK} strokeWidth={2} />
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+
       <View style={{ height: 32 }} />
 
       <CategoryActionSheet
         visible={!!categoryAction}
         categoryName={categoryAction?.name ?? ''}
-        canDelete={categoryActionId !== OPEN_CATEGORY_ID}
+        canModify={categoryActionId !== OPEN_CATEGORY_ID}
         onClose={() => setCategoryActionId(null)}
+        onEdit={() => {
+          if (categoryAction) {
+            setEditingCatId(categoryAction.id);
+            setEditName(categoryAction.name);
+            setEditIcon(Math.max(0, CAT_ICON_GRID.indexOf(categoryAction.icon)));
+            setShowNew(false);
+          }
+          setCategoryActionId(null);
+        }}
         onDelete={() => {
           if (categoryActionId) onDeleteCategory(categoryActionId);
           setCategoryActionId(null);
@@ -612,9 +618,6 @@ export default function HomeScreen() {
   const [verse,        setVerse]       = useState<Verse | null>(null);
   const [showCal,      setShowCal]     = useState(false);
   const [showAddTask,  setShowAddTask] = useState(false);
-  const [dayEnded,     setDayEnded]    = useState(false);
-  const [eodSummary,   setEodSummary]  = useState<string | null>(null);
-  const [eodLoading,   setEodLoading]  = useState(false);
   const [selectedDate, setSelectedDate]= useState(new Date());
   const [actionTask,   setActionTask]  = useState<Task | null>(null);
   const [editingTask,  setEditingTask] = useState<Task | null>(null);
@@ -685,6 +688,12 @@ export default function HomeScreen() {
     setCategories(prev => [...prev, data]);
   }, [userId]);
 
+  const updateCategory = useCallback(async (id: string, name: string, icon: string) => {
+    setCategories(prev => prev.map(c => c.id === id ? { ...c, name, icon } : c));
+    const { error } = await supabase.from('categories').update({ name, icon }).eq('id', id);
+    if (error) console.error(error);
+  }, []);
+
   const removeCategory = useCallback(async (id: string) => {
     setCategories(prev => prev.filter(c => c.id !== id));
     setTasks(prev => prev.map(t => t.categoryId === id ? { ...t, categoryId: null } : t));
@@ -700,45 +709,12 @@ export default function HomeScreen() {
     [categories]
   );
 
-  // Hours-per-category for the week containing selectedDate.
-  const [weekCats, setWeekCats] = useState<WeekCatStat[]>([]);
-
-  const loadWeekStats = useCallback(async () => {
-    if (!userId) return;
-    const monday = mondayOf(selectedDate);
-    const sunday = new Date(monday);
-    sunday.setDate(sunday.getDate() + 6);
-
-    const { data, error } = await supabase
-      .from('tasks')
-      .select('category_id, duration_minutes')
-      .eq('user_id', userId)
-      .gte('date', toISODate(monday))
-      .lte('date', toISODate(sunday))
-      .not('duration_minutes', 'is', null);
-    if (error) { console.error(error); return; }
-
-    const minutesByCategory = new Map<string, number>();
-    for (const row of data ?? []) {
-      const key = row.category_id ?? 'uncategorized';
-      minutesByCategory.set(key, (minutesByCategory.get(key) ?? 0) + (row.duration_minutes ?? 0));
-    }
-
-    const stats: WeekCatStat[] = Array.from(minutesByCategory.entries())
-      .map(([categoryId, minutes]) => {
-        const cat = categories.find(c => c.id === categoryId);
-        return {
-          id:   categoryId,
-          name: (cat?.name ?? 'Uncategorized').toUpperCase(),
-          icon: cat?.icon ?? 'ClipboardList',
-          hrs:  minutes / 60,
-        };
-      })
-      .sort((a, b) => b.hrs - a.hrs);
-
-    setWeekCats(stats);
-  }, [userId, selectedDate, categories]);
-
+  // Slim view of the 30-day task window for AddTaskModal's open-slots
+  // display — covers any date the modal's own date picker can reach.
+  const existingTaskSlots: DayTaskSlot[] = useMemo(
+    () => catTasks.map(t => ({ id: t.id, date: t.date, scheduledTime: t.scheduledTime, durationMinutes: t.durationMins })),
+    [catTasks]
+  );
 
   // Load this user's tasks for the selected date.
   const loadTasks = useCallback(async () => {
@@ -755,7 +731,9 @@ export default function HomeScreen() {
   }, [userId, selectedDate]);
 
   // Load tasks for the next 30 days — used by the Categories tab so it shows
-  // upcoming tasks across all dates, not just the selected day.
+  // upcoming tasks across all dates, not just the selected day. Also pulls in
+  // fully dateless tasks (cleared via edit) so they don't disappear from the
+  // app entirely — Categories is their only home since Day view is per-date.
   const loadCatTasks = useCallback(async () => {
     if (!userId) return;
     const today = toISODate(new Date());
@@ -764,8 +742,7 @@ export default function HomeScreen() {
       .from('tasks')
       .select('*')
       .eq('user_id', userId)
-      .gte('date', today)
-      .lte('date', toISODate(end))
+      .or(`date.is.null,and(date.gte.${today},date.lte.${toISODate(end)})`)
       .order('date', { ascending: true })
       .order('scheduled_time', { ascending: true });
     if (error) { console.error(error); return; }
@@ -775,10 +752,9 @@ export default function HomeScreen() {
   useFocusEffect(
     useCallback(() => {
       loadCategories();
-      loadWeekStats();
       loadTasks();
       loadCatTasks();
-    }, [loadCategories, loadWeekStats, loadTasks, loadCatTasks])
+    }, [loadCategories, loadTasks, loadCatTasks])
   );
 
   const toggle = useCallback(async (id: string) => {
@@ -802,7 +778,7 @@ export default function HomeScreen() {
     if (!userId || !task.recurringRuleId) return;
     setTasks(prev => prev.filter(t => t.id !== task.id));
     setCatTasks(prev => prev.filter(t => t.id !== task.id));
-    await deleteRecurringOccurrence(userId, task.id, task.recurringRuleId, task.date);
+    await deleteRecurringOccurrence(userId, task.id, task.recurringRuleId, task.date!);
   }, [userId]);
 
   const removeSeries = useCallback(async (task: Task) => {
@@ -820,7 +796,7 @@ export default function HomeScreen() {
 
     const { data: row, error } = await supabase
       .from('tasks')
-      .update({ title: nt.title, category_id: categoryId, date: nt.date, scheduled_time: scheduledTime, duration_minutes: durationMinutes, time_period: getTimePeriod(scheduledTime) })
+      .update({ title: nt.title, category_id: categoryId, date: nt.date || null, scheduled_time: scheduledTime, duration_minutes: durationMinutes, time_period: getTimePeriod(scheduledTime) })
       .eq('id', id)
       .select('*')
       .single();
@@ -833,7 +809,7 @@ export default function HomeScreen() {
     }
     const today = toISODate(new Date());
     const catEnd = new Date(); catEnd.setDate(catEnd.getDate() + 30);
-    if (row.date >= today && row.date <= toISODate(catEnd)) {
+    if (inCatWindow(row.date, today, toISODate(catEnd))) {
       setCatTasks(prev =>
         prev.some(t => t.id === id)
           ? prev.map(t => t.id === id ? rowToTask(row) : t)
@@ -849,6 +825,7 @@ export default function HomeScreen() {
     const scheduledTime    = nt.startTime ? to24Hour(nt.startTime) : null;
     const durationMinutes  = nt.duration ? parseInt(nt.duration, 10) : null;
     const categoryId       = (!nt.categoryId || nt.categoryId === OPEN_CATEGORY_ID) ? null : nt.categoryId;
+    const date              = nt.date || null;
 
     let recurringRuleId: string | null = null;
     if (nt.isRecurring) {
@@ -876,7 +853,7 @@ export default function HomeScreen() {
         title:             nt.title,
         category_id:       categoryId,
         recurring_rule_id: recurringRuleId,
-        date:              nt.date,
+        date,
         scheduled_time:    scheduledTime,
         duration_minutes:  durationMinutes,
         time_period:       getTimePeriod(scheduledTime),
@@ -890,7 +867,7 @@ export default function HomeScreen() {
     }
     const today = toISODate(new Date());
     const catEnd = new Date(); catEnd.setDate(catEnd.getDate() + 30);
-    if (row.date >= today && row.date <= toISODate(catEnd)) {
+    if (inCatWindow(row.date, today, toISODate(catEnd))) {
       setCatTasks(prev => [...prev, rowToTask(row)]);
     }
   }, [userId, selectedDate]);
@@ -920,7 +897,7 @@ export default function HomeScreen() {
       if (row.date === toISODate(selectedDate)) {
         setTasks(prev => [...prev, rowToTask(row)]);
       }
-      if (row.date >= today && row.date <= toISODate(catEnd)) {
+      if (inCatWindow(row.date, today, toISODate(catEnd))) {
         setCatTasks(prev => [...prev, rowToTask(row)]);
       }
     }
@@ -929,24 +906,6 @@ export default function HomeScreen() {
   const byPeriod = (p: TimePeriod) => tasks.filter(t => t.timePeriod === p && !t.isTTFO);
   const ttfo        = tasks.filter(t => t.isTTFO);
   const allComplete = tasks.length > 0 && tasks.filter(t => !t.isTTFO).every(t => t.isCompleted);
-
-  const endDay = async () => {
-    setDayEnded(true);
-    setEodSummary(null);
-    setEodLoading(true);
-    try {
-      const dateLabel = selectedDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
-      const summary = await generateEndOfDaySummary(
-        tasks.map(t => ({ title: t.title, isCompleted: t.isCompleted, isTTFO: t.isTTFO })),
-        dateLabel
-      );
-      setEodSummary(summary);
-    } catch (e) {
-      setEodSummary(e instanceof Error ? e.message : 'Could not generate a summary.');
-    } finally {
-      setEodLoading(false);
-    }
-  };
 
   return (
     <SafeAreaView style={s.root}>
@@ -991,19 +950,15 @@ export default function HomeScreen() {
           <PeriodGroup period="unscheduled" tasks={byPeriod('unscheduled')} categoryIconMap={categoryIconMap} onToggle={toggle} onLongPress={setActionTask} />
 
           {allComplete && <RelaxRow />}
-          {dayEnded    && <WrapUpCard tasks={tasks} summary={eodSummary} loading={eodLoading} />}
 
           <TTFOSection tasks={ttfo} categoryIconMap={categoryIconMap} onToggle={toggle} onLongPress={setActionTask} />
           <Footer
             tasks={tasks}
-            dayEnded={dayEnded}
-            onEndDay={endDay}
-            onBackToMorning={() => setDayEnded(false)}
+            onEndDay={() => router.push({ pathname: '/dot-chat', params: { mode: 'evening' } })}
           />
           <View style={{ height: 32 }} />
         </ScrollView>
       )}
-      {!showParty && tab === 'WEEK' && <WeekView tab={tab} onTabChange={t => { setTab(t); setShowCal(false); }} weekCats={weekCats} />}
       {!showParty && tab === 'CATS' && (
         <CatsView
           tab={tab}
@@ -1014,6 +969,7 @@ export default function HomeScreen() {
           onLongPressTask={setActionTask}
           onAddTask={(categoryId, title) => addTask({ title, categoryId, date: toISODate(selectedDate), startTime: '', duration: '', isRecurring: false })}
           onAddCategory={addCategory}
+          onEditCategory={updateCategory}
           onDeleteCategory={removeCategory}
         />
       )}
@@ -1027,6 +983,7 @@ export default function HomeScreen() {
         onAddMany={addTasks}
         categories={categoriesWithOpen}
         initialDate={toISODate(selectedDate)}
+        existingTasks={existingTaskSlots}
         editingTask={editingTask ? {
           id: editingTask.id,
           title: editingTask.title,
@@ -1136,31 +1093,12 @@ const s = StyleSheet.create({
   relaxRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingVertical: 20, gap: 8 },
   relaxTxt: { fontFamily: 'PressStart2P', fontSize: 8, color: INK, lineHeight: 14 },
 
-  // Wrap-up card
-  wrapCard:     { marginHorizontal: MARGIN, marginTop: 14, marginBottom: 6, borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, padding: 14, gap: 8 },
-  wrapLabel:    { fontFamily: 'PressStart2P', fontSize: 6, color: MUTED, lineHeight: 9 },
-  wrapHeadline: { fontFamily: 'VT323', fontSize: 18, color: INK, lineHeight: 22 },
-  wrapPreview:  { fontFamily: 'VT323', fontSize: 14, color: MUTED, lineHeight: 18 },
-
   footer:     { paddingHorizontal: MARGIN, paddingTop: 24, paddingBottom: 8 },
   footerCount:{ fontFamily: 'PressStart2P', fontSize: 7, color: INK, lineHeight: 11, textAlign: 'center', marginBottom: 10 },
   footerRow:  { flexDirection: 'row', alignItems: 'center', gap: 8 },
   endBtn:     { flex: 1, borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, paddingVertical: 11, alignItems: 'center' },
   endBtnTxt:  { fontFamily: 'PressStart2P', fontSize: 7, color: INK, lineHeight: 11 },
   refreshBtn: { width: 40, height: 40, borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, alignItems: 'center', justifyContent: 'center', backgroundColor: BG },
-
-  // ── Week view ──
-  weekHead:       { paddingHorizontal: MARGIN, paddingTop: 16, paddingBottom: 10 },
-  weekHeadLabel:  { fontFamily: 'PressStart2P', fontSize: 6, color: MUTED, letterSpacing: 1 },
-  weekSummary:    { marginHorizontal: MARGIN, marginBottom: 10, borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, paddingHorizontal: 12, paddingVertical: 10 },
-  weekSummaryTxt: { fontFamily: 'VT323', fontSize: 15, color: INK, lineHeight: 20 },
-  weekCatCard:    { marginHorizontal: MARGIN, marginBottom: 6, borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, paddingHorizontal: 12, paddingTop: 10, paddingBottom: 8 },
-  weekCatHeader:  { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 },
-  weekCatName:    { fontFamily: 'PressStart2P', fontSize: 7, color: INK, lineHeight: 11 },
-  weekCatHrs:     { fontFamily: 'PressStart2P', fontSize: 7, color: INK, lineHeight: 11 },
-  weekBarTrack:   { height: 8, backgroundColor: '#E8E4E0', borderRadius: 2, overflow: 'hidden' },
-  weekBarFill:    { height: 8, backgroundColor: INK, borderRadius: 2 },
-  weekFootnote:   { marginHorizontal: MARGIN, marginTop: 8, fontFamily: 'PressStart2P', fontSize: 5, color: MUTED, lineHeight: 8 },
 
   // ── CATS view ──
   catsHead:     { paddingHorizontal: MARGIN, paddingTop: 16, paddingBottom: 12 },

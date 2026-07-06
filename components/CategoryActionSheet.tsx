@@ -1,6 +1,6 @@
 import React from 'react';
 import { Modal, View, Text, TouchableOpacity, StyleSheet, TouchableWithoutFeedback } from 'react-native';
-import { Trash2 } from 'lucide-react-native';
+import { Trash2, Pencil } from 'lucide-react-native';
 
 const INK = '#2D2D2D';
 const BG = '#FEFEFE';
@@ -12,12 +12,13 @@ const RADIUS = 4;
 interface Props {
   visible: boolean;
   categoryName: string;
-  canDelete: boolean;
+  canModify: boolean;
   onClose: () => void;
+  onEdit: () => void;
   onDelete: () => void;
 }
 
-export default function CategoryActionSheet({ visible, categoryName, canDelete, onClose, onDelete }: Props) {
+export default function CategoryActionSheet({ visible, categoryName, canModify, onClose, onEdit, onDelete }: Props) {
   return (
     <Modal visible={visible} transparent animationType="fade" statusBarTranslucent>
       <TouchableWithoutFeedback onPress={onClose}>
@@ -26,13 +27,19 @@ export default function CategoryActionSheet({ visible, categoryName, canDelete, 
       <View style={s.sheet}>
         <Text style={s.title} numberOfLines={1}>{categoryName.toUpperCase()}</Text>
 
-        {canDelete ? (
-          <TouchableOpacity style={s.row} onPress={onDelete} activeOpacity={0.7}>
-            <Trash2 size={16} color={RED} strokeWidth={1.5} />
-            <Text style={[s.rowTxt, s.deleteTxt]}>DELETE CATEGORY</Text>
-          </TouchableOpacity>
+        {canModify ? (
+          <>
+            <TouchableOpacity style={s.row} onPress={onEdit} activeOpacity={0.7}>
+              <Pencil size={16} color={INK} strokeWidth={1.5} />
+              <Text style={s.rowTxt}>EDIT CATEGORY</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={s.row} onPress={onDelete} activeOpacity={0.7}>
+              <Trash2 size={16} color={RED} strokeWidth={1.5} />
+              <Text style={[s.rowTxt, s.deleteTxt]}>DELETE CATEGORY</Text>
+            </TouchableOpacity>
+          </>
         ) : (
-          <Text style={s.subLabel}>THIS CATEGORY CAN'T BE DELETED</Text>
+          <Text style={s.subLabel}>THIS CATEGORY CAN'T BE EDITED</Text>
         )}
         <TouchableOpacity style={s.cancelBtn} onPress={onClose} activeOpacity={0.7}>
           <Text style={s.cancelTxt}>CANCEL</Text>

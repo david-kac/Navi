@@ -5,7 +5,7 @@ import {
   ActivityIndicator, KeyboardAvoidingView, Platform, Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useRouter } from 'expo-router';
+import { useRouter, useLocalSearchParams } from 'expo-router';
 import { ChevronLeft, AlertTriangle, CheckCircle2, Paperclip, X } from 'lucide-react-native';
 import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
@@ -45,7 +45,7 @@ function fmt12(hhmm: string): string {
   return `${h12}:${m.toString().padStart(2, '0')} ${ap}`;
 }
 
-type Mode = 'morning' | 'anytime';
+type Mode = 'morning' | 'anytime' | 'evening';
 type Stage = 'loading' | 'chatting' | 'locked';
 
 interface DisplayMessage { id: string; kind: 'user' | 'dot' | 'added'; text: string }
@@ -102,8 +102,24 @@ async function fetchUpcomingTasks(userId: string, today: string): Promise<TaskRo
   return (rows ?? []) as TaskRow[];
 }
 
+// Plain-language done/missed/undecided breakdown fed into the evening
+// wrap-up system prompt (mirrors generateEndOfDaySummary's grouping, but as
+// data for the conversational flow rather than a one-shot generated recap).
+function formatEodBreakdown(rows: TaskRow[]): string {
+  const real   = rows.filter(r => !r.is_ttfo);
+  const done   = real.filter(r => r.is_completed).map(r => r.title);
+  const missed = real.filter(r => !r.is_completed).map(r => r.title);
+  const ttfo   = rows.filter(r => r.is_ttfo).map(r => r.title);
+  return [
+    `DONE:\n${done.length ? done.map(t => `- ${t}`).join('\n') : 'Nothing'}`,
+    `MISSED:\n${missed.length ? missed.map(t => `- ${t}`).join('\n') : 'Nothing'}`,
+    `STILL UNDECIDED:\n${ttfo.length ? ttfo.map(t => `- ${t}`).join('\n') : 'Nothing'}`,
+  ].join('\n\n');
+}
+
 export default function DotChat() {
   const router = useRouter();
+  const { mode: modeParam } = useLocalSearchParams<{ mode?: string }>();
   const { session } = useAuth();
   const userId = session?.user.id;
 
@@ -124,6 +140,22 @@ export default function DotChat() {
   const [suggestedTasks, setSuggestedTasks] = useState<SuggestedTask[]>([]);
   const [showPreview,    setShowPreview]    = useState(false);
 
+  // Claude occasionally mistypes a character or two when copying a long uuid
+  // into a tool call. Before giving up, fall back to matching this user's
+  // tasks by title (+ date, if given) so a near-miss id doesn't silently
+  // fail move/delete requests.
+  const resolveTaskId = useCallback(async (taskId: string, currentTitle?: string, currentDate?: string): Promise<string | null> => {
+    const { data: direct } = await supabase.from('tasks').select('id').eq('id', taskId).maybeSingle();
+    if (direct) return direct.id;
+    if (!currentTitle || !userId) return null;
+
+    let query = supabase.from('tasks').select('id').eq('user_id', userId).ilike('title', currentTitle.trim());
+    if (currentDate) query = query.eq('date', currentDate);
+    const { data: matches } = await query;
+    if (matches && matches.length === 1) return matches[0].id;
+    return null;
+  }, [userId]);
+
   const executeAddTask = useCallback(async (taskInput: AddTaskToolInput): Promise<{ success: boolean; message: string }> => {
     if (!userId) return { success: false, message: 'Not signed in.' };
 
@@ -133,10 +165,35 @@ export default function DotChat() {
     const date = taskInput.date && /^\d{4}-\d{2}-\d{2}$/.test(taskInput.date) ? taskInput.date : toISODate(new Date());
     const scheduledTime = taskInput.scheduledTime ? `${taskInput.scheduledTime}:00` : null;
 
+    let recurringRuleId: string | null = null;
+    if (taskInput.isRecurring) {
+      const ruleType = taskInput.ruleType ?? 'daily';
+      const { data: rule, error: ruleError } = await supabase
+        .from('recurring_task_rules')
+        .insert({
+          user_id:           userId,
+          title:             taskInput.title,
+          category_id:       matchedCategory?.id ?? null,
+          rule_type:         ruleType,
+          days_of_week:      ruleType === 'weekly' ? taskInput.daysOfWeek ?? null : null,
+          scheduled_time:    scheduledTime,
+          duration_minutes:  taskInput.durationMinutes ?? null,
+          time_period:       getTimePeriod(scheduledTime),
+        })
+        .select('id')
+        .single();
+      if (ruleError) {
+        console.error(ruleError);
+        return { success: false, message: `Failed to add recurring task: ${ruleError.message}` };
+      }
+      recurringRuleId = rule.id;
+    }
+
     const { error } = await supabase.from('tasks').insert({
       user_id:           userId,
       title:             taskInput.title,
       category_id:       matchedCategory?.id ?? null,
+      recurring_rule_id: recurringRuleId,
       date,
       scheduled_time:    scheduledTime,
       duration_minutes:  taskInput.durationMinutes ?? null,
@@ -147,24 +204,40 @@ export default function DotChat() {
       console.error(error);
       return { success: false, message: `Failed to add task: ${error.message}` };
     }
-    setDisplay(prev => [...prev, { id: `added-${Date.now()}`, kind: 'added', text: `+ Added "${taskInput.title}"${date !== toISODate(new Date()) ? ` for ${date}` : ''}` }]);
+    setDisplay(prev => [...prev, { id: `added-${Date.now()}`, kind: 'added', text: `+ Added "${taskInput.title}"${date !== toISODate(new Date()) ? ` for ${date}` : ''}${recurringRuleId ? ' (recurring)' : ''}` }]);
     return { success: true, message: 'Task added successfully.' };
   }, [userId, categories]);
 
   const executeUpdateTask = useCallback(async (taskInput: UpdateTaskToolInput): Promise<{ success: boolean; message: string }> => {
+    const realId = await resolveTaskId(taskInput.taskId, taskInput.currentTitle, taskInput.currentDate);
+    if (!realId) {
+      return { success: false, message: "Failed to update task: couldn't find a task matching that id or title." };
+    }
+
     const patch: Database['public']['Tables']['tasks']['Update'] = {};
     if (taskInput.title !== undefined) patch.title = taskInput.title;
-    if (taskInput.date !== undefined) patch.date = taskInput.date;
-    if (taskInput.scheduledTime !== undefined) {
+    if (taskInput.clearDate) {
+      patch.date = null;
+    } else if (taskInput.date !== undefined) {
+      patch.date = taskInput.date;
+    }
+    if (taskInput.clearScheduledTime) {
+      patch.scheduled_time = null;
+      patch.time_period = 'unscheduled';
+    } else if (taskInput.scheduledTime !== undefined) {
       patch.scheduled_time = `${taskInput.scheduledTime}:00`;
       patch.time_period = getTimePeriod(patch.scheduled_time);
     }
     if (taskInput.durationMinutes !== undefined) patch.duration_minutes = taskInput.durationMinutes;
+    if (taskInput.categoryName !== undefined) {
+      const matched = categories.find(c => c.name.toLowerCase() === taskInput.categoryName!.toLowerCase());
+      patch.category_id = matched?.id ?? null;
+    }
 
     const { data: row, error } = await supabase
       .from('tasks')
       .update(patch)
-      .eq('id', taskInput.taskId)
+      .eq('id', realId)
       .select('title')
       .single();
 
@@ -174,26 +247,31 @@ export default function DotChat() {
     }
     setDisplay(prev => [...prev, { id: `updated-${Date.now()}`, kind: 'added', text: `✎ Updated "${row.title}"` }]);
     return { success: true, message: 'Task updated successfully.' };
-  }, []);
+  }, [categories, resolveTaskId]);
 
   const executeDeleteTask = useCallback(async (taskInput: DeleteTaskToolInput): Promise<{ success: boolean; message: string }> => {
+    const realId = await resolveTaskId(taskInput.taskId, taskInput.currentTitle, taskInput.currentDate);
+    if (!realId) {
+      return { success: false, message: "Failed to delete task: couldn't find a task matching that id or title." };
+    }
+
     const { data: row, error: fetchError } = await supabase
       .from('tasks')
       .select('title')
-      .eq('id', taskInput.taskId)
+      .eq('id', realId)
       .single();
     if (fetchError || !row) {
       return { success: false, message: `Failed to delete task: ${fetchError?.message ?? 'not found'}` };
     }
 
-    const { error } = await supabase.from('tasks').delete().eq('id', taskInput.taskId);
+    const { error } = await supabase.from('tasks').delete().eq('id', realId);
     if (error) {
       console.error(error);
       return { success: false, message: `Failed to delete task: ${error.message}` };
     }
     setDisplay(prev => [...prev, { id: `deleted-${Date.now()}`, kind: 'added', text: `- Removed "${row.title}"` }]);
     return { success: true, message: 'Task deleted successfully.' };
-  }, []);
+  }, [resolveTaskId]);
 
   const executeReviewSchedule = useCallback(async (): Promise<{ success: boolean; message: string }> => {
     if (!userId) return { success: false, message: 'Not signed in.' };
@@ -286,15 +364,20 @@ export default function DotChat() {
     const now = new Date();
     const today = toISODate(now);
 
-    const isMorning = await shouldShowMorningFlow();
-    const sessionMode: Mode = isMorning ? 'morning' : 'anytime';
+    let sessionMode: Mode;
+    if (modeParam === 'evening') {
+      sessionMode = 'evening';
+    } else {
+      const isMorning = await shouldShowMorningFlow();
+      sessionMode = isMorning ? 'morning' : 'anytime';
+      if (isMorning) await markMorningFlowShown();
+    }
     setMode(sessionMode);
-    if (isMorning) await markMorningFlowShown();
 
     const { data: catRows } = await supabase.from('categories').select('*').eq('user_id', userId);
     setCategories(catRows ?? []);
 
-    const { conflicts: detected } = await fetchTodayState(userId, today);
+    const { rows: todayRows, conflicts: detected } = await fetchTodayState(userId, today);
     setConflicts(detected);
 
     const upcomingRows = await fetchUpcomingTasks(userId, today);
@@ -321,12 +404,18 @@ export default function DotChat() {
       categoryNames: (catRows ?? []).map(c => c.name),
       mode: sessionMode,
       verse,
+      eodBreakdown: sessionMode === 'evening' ? formatEodBreakdown(todayRows) : undefined,
     });
     systemPromptRef.current = system;
 
+    // Evening wrap-up is a distinct session from the morning/anytime chat —
+    // give it its own storage key so opening it doesn't restore (and skip
+    // the greeting for) whatever David already chatted about earlier today.
+    const storageKey = `dot_chat_${today}${sessionMode === 'evening' ? '_evening' : ''}`;
+
     // Restore persisted chat from earlier today — skip the greeting if found.
     try {
-      const persisted = await AsyncStorage.getItem(`dot_chat_${today}`);
+      const persisted = await AsyncStorage.getItem(storageKey);
       if (persisted) {
         const { history, display: savedDisplay } = JSON.parse(persisted);
         historyRef.current = history;
@@ -340,6 +429,8 @@ export default function DotChat() {
 
     const kickoff = sessionMode === 'morning'
       ? "Give me my morning greeting, share today's verse exactly as written, and a quick summary of today. Keep it short."
+      : sessionMode === 'evening'
+      ? "Give me my end-of-day wrap-up: summarize what I finished, what I missed, and anything still undecided today, then ask what I want to do with anything unfinished. Keep it warm and brief."
       : 'Just say a short casual hello and ask what\'s on my mind. Keep it to one sentence.';
 
     setSending(true);
@@ -354,19 +445,22 @@ export default function DotChat() {
     } finally {
       setSending(false);
     }
-  }, [userId, executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule]);
+  }, [userId, modeParam, executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule]);
 
-  useEffect(() => { greet(); }, [userId]);
+  useEffect(() => { greet(); }, [userId, modeParam]);
 
   // Persist the full chat to AsyncStorage after each completed exchange so it
-  // survives navigation. The key is date-scoped, so tomorrow starts fresh.
+  // survives navigation. The key is date- and mode-scoped (evening wrap-up
+  // gets its own key — see greet()), so tomorrow starts fresh and opening
+  // the wrap-up doesn't clobber or get clobbered by the daily chat.
   useEffect(() => {
     if (stage !== 'chatting' || sending) return;
+    const storageKey = `dot_chat_${toISODate(new Date())}${mode === 'evening' ? '_evening' : ''}`;
     AsyncStorage.setItem(
-      `dot_chat_${toISODate(new Date())}`,
+      storageKey,
       JSON.stringify({ history: historyRef.current, display }),
     ).catch(console.error);
-  }, [display, stage, sending]);
+  }, [display, stage, sending, mode]);
 
   const send = async () => {
     if (attachment) { analyzeAttachment(); return; }
@@ -383,7 +477,6 @@ export default function DotChat() {
       setDisplay(prev => [...prev, { id: `e-${Date.now()}`, kind: 'dot', text: e instanceof Error ? e.message : 'Something went wrong.' }]);
     } finally {
       setSending(false);
-      setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 50);
     }
   };
 
@@ -400,7 +493,7 @@ export default function DotChat() {
         <TouchableOpacity onPress={() => router.back()} style={s.backBtn} activeOpacity={0.7}>
           <ChevronLeft size={16} color={INK} strokeWidth={2} />
         </TouchableOpacity>
-        <Text style={s.headerTitle}>{mode === 'morning' ? 'MORNING PLAN' : 'DOT'}</Text>
+        <Text style={s.headerTitle}>{mode === 'morning' ? 'MORNING PLAN' : mode === 'evening' ? 'END OF DAY' : 'DOT'}</Text>
       </View>
 
       {stage === 'loading' && (
@@ -412,7 +505,12 @@ export default function DotChat() {
 
       {stage === 'chatting' && (
         <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-          <ScrollView ref={scrollRef} style={s.chat} contentContainerStyle={{ gap: 10, paddingBottom: 12 }}>
+          <ScrollView
+            ref={scrollRef}
+            style={s.chat}
+            contentContainerStyle={{ gap: 10, paddingBottom: 12 }}
+            onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: true })}
+          >
             {display.map(m => (
               m.kind === 'added' ? (
                 <View key={m.id} style={s.addedRow}><Text style={s.addedTxt}>{m.text}</Text></View>
@@ -462,6 +560,11 @@ export default function DotChat() {
           {mode === 'morning' && (
             <TouchableOpacity style={s.lockBtn} onPress={lockPlan} activeOpacity={0.8}>
               <Text style={s.lockBtnTxt}>LOCK PLAN</Text>
+            </TouchableOpacity>
+          )}
+          {mode === 'evening' && (
+            <TouchableOpacity style={s.lockBtn} onPress={() => router.back()} activeOpacity={0.8}>
+              <Text style={s.lockBtnTxt}>DONE FOR TODAY</Text>
             </TouchableOpacity>
           )}
         </KeyboardAvoidingView>

@@ -12,8 +12,9 @@ interface ScheduleContext {
   upcomingTasks: string;
   conflicts: string;
   categoryNames?: string[];
-  mode: 'morning' | 'anytime';
+  mode: 'morning' | 'anytime' | 'evening';
   verse?: { text: string; reference: string };
+  eodBreakdown?: string;
 }
 
 export function buildDotSystemPrompt(ctx: ScheduleContext): string {
@@ -31,9 +32,11 @@ ${ctx.upcomingTasks || 'No tasks scheduled yet.'}
 
 CONFLICTS DETECTED AT SESSION START (may be stale if you've made changes since — use review_schedule for a fresh check):
 ${ctx.conflicts || 'None.'}
-
+${ctx.mode === 'evening' ? `\nTODAY'S BREAKDOWN — done / missed / still undecided:\n${ctx.eodBreakdown || 'Nothing tracked today.'}\n` : ''}
 SESSION TYPE: ${ctx.mode === 'morning'
     ? 'This is the once-daily automatic morning session. Greet David, share TODAY\'S VERSE exactly as written, and give a short summary of today. End the conversation working toward a locked plan.'
+    : ctx.mode === 'evening'
+    ? "This is the end-of-day wrap-up session (David tapped END MY DAY). Start by summarizing TODAY'S BREAKDOWN above: briefly celebrate what got done, gently note what got missed (no guilt), and surface anything still undecided. Then, for each unfinished task, ask what David wants to do with it — move it to tomorrow, reschedule to a specific day/time, or drop it. Use update_task (with a new date/scheduledTime, or clearScheduledTime/clearDate to unschedule it) or delete_task (after confirming) based on his answer. If there's nothing unfinished, just celebrate and keep it short. End the conversation once every open item has been addressed or David says he's done — don't keep pushing after that."
     : 'This is an ad-hoc anytime chat (David tapped your avatar). Keep your opening line to one short casual line like "Hey, what\'s up?" — no verse, no full summary unless he asks for one.'}
 
 PERSONALITY:
@@ -50,15 +53,18 @@ TOOLS — add_task (new tasks):
 - Only call add_task once David confirms a proposed time (e.g. "yes", "sounds good", "do it"). Use the exact times you proposed. If he asks for changes, propose again and wait for confirmation again.
 - Never silently schedule something David didn't give a time for — always propose first and wait for a yes.
 - If David gives an explicit time, the above wait-for-confirmation rule does not apply — go ahead and call add_task immediately.
+- If David says the task repeats ("every day", "every Monday and Wednesday", "daily", "weekdays"), set isRecurring true and fill in ruleType/daysOfWeek — same rules as any other add_task field.
 
-TOOLS — update_task (moving/editing existing tasks):
-- Use this when David asks to move, reschedule, rename, or change the duration of something already on UPCOMING SCHEDULE. Find the matching task by title (and date, if he mentions one or it's otherwise ambiguous) and use its id.
+TOOLS — update_task (moving/editing/rescheduling existing tasks — covers everything the task edit screen can do: new title, date, time, duration, category, clearing the time, or clearing the date entirely to make it a dateless backlog item):
+- Use this when David asks to move, reschedule, rename, recategorize, or change the duration of something already on UPCOMING SCHEDULE, or to unschedule/de-date it. Find the matching task by title (and date, if he mentions one or it's otherwise ambiguous) and use its id. Always also pass currentTitle (and currentDate if known) — this lets the app recover the right task even if the id gets mistyped.
 - Same confirmation rule as add_task: if David gives an explicit new time ("move my run to 7am"), call update_task right away. If he's vague ("move my run to the morning", "push cleaning back a bit"), propose a specific new time first and wait for a yes before calling update_task.
+- To move a task to a different category, set categoryName to an exact match from the available categories.
+- To clear a task's start time (send it to Unscheduled for that day) without removing its date, set clearScheduledTime true. To remove its date entirely (a fully dateless backlog item, no longer tied to any day), set clearDate true. These are explicit David requests only — never clear something he didn't ask to clear.
 - Only change the fields David actually wants changed — omit the rest.
 - If multiple tasks could match what David said (e.g. a recurring task appears on several dates), ask which one he means instead of guessing.
 
 TOOLS — delete_task (removing existing tasks):
-- Use this when David asks to delete, remove, or cancel something already on UPCOMING SCHEDULE. Find the matching task by title (and date if needed to disambiguate).
+- Use this when David asks to delete, remove, or cancel something already on UPCOMING SCHEDULE. Find the matching task by title (and date if needed to disambiguate). Always also pass currentTitle (and currentDate if known) as a fallback identifier, same as update_task.
 - Always confirm before deleting — never call delete_task on the first ask. Reply with exactly: "Got it — you want me to delete [task name]? Just confirm and I'll remove it." (using the real task title in place of [task name]).
 - Only call delete_task after David clearly confirms (e.g. "yes", "confirm", "do it").
 - If multiple tasks could match what David said, ask which one he means instead of guessing.
@@ -202,6 +208,9 @@ const ADD_TASK_TOOL = {
       date:             { type: 'string', description: 'YYYY-MM-DD. Omit to default to today.' },
       scheduledTime:    { type: 'string', description: 'HH:MM 24-hour. Omit if no specific time was mentioned.' },
       durationMinutes:  { type: 'number', description: 'Omit if no duration was mentioned.' },
+      isRecurring:      { type: 'boolean', description: 'True if the user said this repeats ("every day", "every Monday", "weekdays"). Omit or false for a one-off task.' },
+      ruleType:         { type: 'string', enum: ['daily', 'weekly'], description: "Required if isRecurring is true. 'daily' for every day, 'weekly' for specific weekdays." },
+      daysOfWeek:       { type: 'array', items: { type: 'number' }, description: "Required if ruleType is 'weekly'. Integers 0=Sunday...6=Saturday, e.g. weekdays = [1,2,3,4,5]." },
     },
     required: ['title'],
   },
@@ -213,19 +222,27 @@ export interface AddTaskToolInput {
   date?: string;
   scheduledTime?: string;
   durationMinutes?: number;
+  isRecurring?: boolean;
+  ruleType?: 'daily' | 'weekly';
+  daysOfWeek?: number[];
 }
 
 const UPDATE_TASK_TOOL = {
   name: 'update_task',
-  description: "Move or edit an existing task on the user's schedule. Use the task's id from TODAY'S SCHEDULE.",
+  description: "Move or edit an existing task on the user's schedule — anything the task edit screen can do: rename, reschedule, change duration, change category, or clear its time/date. Use the task's id from UPCOMING SCHEDULE.",
   input_schema: {
     type: 'object',
     properties: {
-      taskId:           { type: 'string', description: "The task's id, copied exactly from TODAY'S SCHEDULE." },
-      title:            { type: 'string', description: 'New title. Omit if not changing.' },
-      date:             { type: 'string', description: 'New YYYY-MM-DD if moving to a different day. Omit if not changing.' },
-      scheduledTime:    { type: 'string', description: 'New HH:MM 24-hour start time. Omit if not changing.' },
-      durationMinutes:  { type: 'number', description: 'New duration in minutes. Omit if not changing.' },
+      taskId:             { type: 'string', description: "The task's id, copied exactly from UPCOMING SCHEDULE." },
+      currentTitle:       { type: 'string', description: "The task's current title, exactly as shown in UPCOMING SCHEDULE. Always include this as a fallback in case the id doesn't match." },
+      currentDate:        { type: 'string', description: "The task's current YYYY-MM-DD date from UPCOMING SCHEDULE, if it has one. Helps disambiguate when currentTitle matches multiple tasks (e.g. a recurring task)." },
+      title:              { type: 'string', description: 'New title. Omit if not changing.' },
+      date:               { type: 'string', description: 'New YYYY-MM-DD if moving to a different day. Omit if not changing.' },
+      scheduledTime:      { type: 'string', description: 'New HH:MM 24-hour start time. Omit if not changing.' },
+      durationMinutes:    { type: 'number', description: 'New duration in minutes. Omit if not changing.' },
+      categoryName:       { type: 'string', description: 'Move the task to this category. Must exactly match one of the available categories. Omit if not changing.' },
+      clearScheduledTime: { type: 'boolean', description: 'True to remove the start time only, sending the task to Unscheduled for its date. Only set when the user explicitly asks to unschedule/clear the time.' },
+      clearDate:          { type: 'boolean', description: 'True to remove the date entirely, making the task a dateless backlog item no longer tied to any day. Only set when the user explicitly asks to remove the date.' },
     },
     required: ['taskId'],
   },
@@ -233,10 +250,15 @@ const UPDATE_TASK_TOOL = {
 
 export interface UpdateTaskToolInput {
   taskId: string;
+  currentTitle?: string;
+  currentDate?: string;
   title?: string;
   date?: string;
   scheduledTime?: string;
   durationMinutes?: number;
+  categoryName?: string;
+  clearScheduledTime?: boolean;
+  clearDate?: boolean;
 }
 
 const DELETE_TASK_TOOL = {
@@ -245,7 +267,9 @@ const DELETE_TASK_TOOL = {
   input_schema: {
     type: 'object',
     properties: {
-      taskId: { type: 'string', description: "The task's id, copied exactly from TODAY'S SCHEDULE." },
+      taskId:       { type: 'string', description: "The task's id, copied exactly from UPCOMING SCHEDULE." },
+      currentTitle: { type: 'string', description: "The task's current title, exactly as shown in UPCOMING SCHEDULE. Always include this as a fallback in case the id doesn't match." },
+      currentDate:  { type: 'string', description: "The task's current YYYY-MM-DD date from UPCOMING SCHEDULE, if it has one. Helps disambiguate when currentTitle matches multiple tasks." },
     },
     required: ['taskId'],
   },
@@ -253,6 +277,8 @@ const DELETE_TASK_TOOL = {
 
 export interface DeleteTaskToolInput {
   taskId: string;
+  currentTitle?: string;
+  currentDate?: string;
 }
 
 const REVIEW_SCHEDULE_TOOL = {
@@ -415,12 +441,15 @@ Rules:
 - categoryName must exactly match one of the available categories, or be null.
 - Extract every distinct actionable item — don't summarise or merge.`;
 
+  // PDF support is GA (base64 document blocks need no beta header) — the
+  // pdfs-2024-09-25 flag this used to send was an early-access beta that's
+  // since been retired; leaving it in risked the API rejecting the request
+  // outright on an unrecognized beta value.
   const headers: Record<string, string> = {
     'content-type':     'application/json',
     'x-api-key':         apiKey,
     'anthropic-version': '2023-06-01',
   };
-  if (isPdf) headers['anthropic-beta'] = 'pdfs-2024-09-25';
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -462,28 +491,3 @@ Rules:
   })).filter(t => t.title);
 }
 
-// ─── End-of-day summary ────────────────────────────────────────────────────────
-
-export interface EndOfDayTask {
-  title: string;
-  isCompleted: boolean;
-  isTTFO: boolean;
-}
-
-export async function generateEndOfDaySummary(tasks: EndOfDayTask[], dateLabel: string): Promise<string> {
-  const done   = tasks.filter(t => !t.isTTFO && t.isCompleted).map(t => t.title);
-  const missed = tasks.filter(t => !t.isTTFO && !t.isCompleted).map(t => t.title);
-  const ttfo   = tasks.filter(t => t.isTTFO).map(t => t.title);
-
-  const system = `You are Dot, David's warm, direct personal companion. It's the end of the day (${dateLabel}). Write a short end-of-day recap in your voice: 2-4 short sentences, plain prose, no bullet points or markdown.
-
-Mention what got done (briefly celebrate), what got missed and should carry forward to tomorrow (gently, no guilt), and anything still undecided ("things to figure out"). If everything was done and nothing is undecided, just celebrate — don't invent problems to mention.`;
-
-  const userMsg = [
-    `DONE:\n${done.length ? done.map(t => `- ${t}`).join('\n') : 'Nothing'}`,
-    `MISSED:\n${missed.length ? missed.map(t => `- ${t}`).join('\n') : 'Nothing'}`,
-    `STILL UNDECIDED:\n${ttfo.length ? ttfo.map(t => `- ${t}`).join('\n') : 'Nothing'}`,
-  ].join('\n\n');
-
-  return callDot(system, [{ role: 'user', content: userMsg }], 300);
-}

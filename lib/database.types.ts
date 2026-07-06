@@ -245,7 +245,7 @@ export type Database = {
         Row: {
           category_id: string | null
           created_at: string
-          date: string
+          date: string | null
           duration_minutes: number | null
           goal_id: string | null
           id: string
@@ -261,7 +261,7 @@ export type Database = {
         Insert: {
           category_id?: string | null
           created_at?: string
-          date: string
+          date?: string | null
           duration_minutes?: number | null
           goal_id?: string | null
           id?: string
@@ -277,7 +277,7 @@ export type Database = {
         Update: {
           category_id?: string | null
           created_at?: string
-          date?: string
+          date?: string | null
           duration_minutes?: number | null
           goal_id?: string | null
           id?: string

@@ -1,10 +1,10 @@
-import React, { useRef, useState, useCallback, useEffect } from 'react';
+import React, { useRef, useState, useCallback, useEffect, useMemo } from 'react';
 import {
   Modal, View, Text, TextInput, TouchableOpacity,
   StyleSheet, KeyboardAvoidingView, Platform, TouchableWithoutFeedback,
   ScrollView, NativeSyntheticEvent, NativeScrollEvent, Alert, ActivityIndicator,
 } from 'react-native';
-import { ChevronDown, RefreshCw, Clock, Calendar, Paperclip, X } from 'lucide-react-native';
+import { ChevronDown, RefreshCw, Calendar, Paperclip, X } from 'lucide-react-native';
 import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
@@ -28,7 +28,7 @@ const ITEM_H  = 44;
 const WEEK_DAYS = ['Mo','Tu','We','Th','Fr','Sa','Su'];
 
 type RepeatType = 'daily' | 'weekly' | 'monthly';
-type Panel = 'main' | 'category' | 'time' | 'date' | 'upload';
+type Panel = 'main' | 'category' | 'time' | 'endTime' | 'date' | 'upload';
 
 interface AttachedFile {
   base64: string;
@@ -52,12 +52,83 @@ function toISODate(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
-function dateLabel(d: Date): string {
+function dateLabel(d: Date | null): string {
+  if (!d) return 'No date';
   const today = new Date();
   const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
   if (toISODate(d) === toISODate(today)) return 'Today';
   if (toISODate(d) === toISODate(tomorrow)) return 'Tomorrow';
   return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+}
+
+// Minutes since midnight for a 12-hour picker triple, used to compute
+// duration from a start + end time pair.
+function minutesOfDay(hour12: string, minute: string, period: 'AM' | 'PM'): number {
+  let h = parseInt(hour12, 10) % 12;
+  if (period === 'PM') h += 12;
+  return h * 60 + parseInt(minute, 10);
+}
+
+// ─── Open time slots (informational — shows the selected date's free gaps) ───
+export interface DayTaskSlot {
+  id: string;
+  date: string | null;
+  scheduledTime?: string;
+  durationMinutes?: number;
+}
+
+const OPEN_SLOTS_DAY_START = 6 * 60;   // 6:00 AM
+const OPEN_SLOTS_DAY_END   = 23 * 60;  // 11:00 PM
+const OPEN_SLOTS_MIN_GAP   = 15;       // ignore slivers shorter than this
+
+function hhmmToMinutes(t: string): number {
+  const [h, m] = t.split(':').map(Number);
+  return h * 60 + m;
+}
+
+function minutesToLabel(mins: number): string {
+  const h24 = Math.floor(mins / 60) % 24;
+  const m = mins % 60;
+  const period = h24 >= 12 ? 'PM' : 'AM';
+  const h12 = h24 % 12 === 0 ? 12 : h24 % 12;
+  return `${h12}:${m.toString().padStart(2, '0')} ${period}`;
+}
+
+// Tasks with a time but no duration still occupy the calendar — assume a
+// default 30 min block for gap purposes rather than ignoring them.
+function computeOpenSlots(dayTasks: DayTaskSlot[]): { start: number; end: number }[] {
+  const occupied = dayTasks
+    .filter(t => t.scheduledTime)
+    .map(t => {
+      const start = hhmmToMinutes(t.scheduledTime!);
+      return { start, end: start + (t.durationMinutes ?? 30) };
+    })
+    .sort((a, b) => a.start - b.start);
+
+  const merged: { start: number; end: number }[] = [];
+  for (const seg of occupied) {
+    const last = merged[merged.length - 1];
+    if (last && seg.start <= last.end) {
+      last.end = Math.max(last.end, seg.end);
+    } else {
+      merged.push({ ...seg });
+    }
+  }
+
+  const gaps: { start: number; end: number }[] = [];
+  let cursor = OPEN_SLOTS_DAY_START;
+  for (const seg of merged) {
+    const start = Math.max(seg.start, OPEN_SLOTS_DAY_START);
+    const end   = Math.min(seg.end, OPEN_SLOTS_DAY_END);
+    if (start > cursor && start - cursor >= OPEN_SLOTS_MIN_GAP) {
+      gaps.push({ start: cursor, end: start });
+    }
+    cursor = Math.max(cursor, end);
+  }
+  if (OPEN_SLOTS_DAY_END - cursor >= OPEN_SLOTS_MIN_GAP) {
+    gaps.push({ start: cursor, end: OPEN_SLOTS_DAY_END });
+  }
+  return gaps;
 }
 
 interface CategoryOption {
@@ -71,7 +142,7 @@ export interface EditableTask {
   id:               string;
   title:            string;
   categoryId:       string | null;
-  date:             string; // "YYYY-MM-DD"
+  date:             string | null; // "YYYY-MM-DD", null = no date set
   scheduledTime?:   string; // "HH:MM" or "HH:MM:SS", 24-hour
   durationMinutes?: number;
 }
@@ -85,6 +156,7 @@ interface Props {
   categories?:  CategoryOption[];
   editingTask?: EditableTask | null;
   initialDate?: string; // "YYYY-MM-DD", defaults to today when adding
+  existingTasks?: DayTaskSlot[]; // used to show open time slots for the selected date
 }
 
 // ─── Scroll column for time picker ───────────────────────────────────────────
@@ -251,12 +323,12 @@ const r = StyleSheet.create({
 });
 
 // ─── Main component ───────────────────────────────────────────────────────────
-export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMany, categories, editingTask, initialDate }: Props) {
+export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMany, categories, editingTask, initialDate, existingTasks }: Props) {
   const options = categories && categories.length > 0 ? categories : DEFAULT_CATEGORIES;
 
   const [title,       setTitle]       = useState('');
   const [categoryId,  setCategoryId]  = useState(options[0]?.id ?? '');
-  const [date,        setDate]        = useState(new Date());
+  const [date,        setDate]        = useState<Date | null>(new Date());
   const [duration,    setDuration]    = useState('');
   const [isRecurring, setIsRecurring] = useState(false);
   const [repeatType,  setRepeatType]  = useState<RepeatType>('daily');
@@ -270,6 +342,12 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
   const [period,  setPeriod]  = useState<'AM' | 'PM'>('AM');
   const [timeSet, setTimeSet] = useState(false);
 
+  // End time picker state — optional; used only to auto-compute duration.
+  const [endHour,    setEndHour]    = useState('08');
+  const [endMinute,  setEndMinute]  = useState('30');
+  const [endPeriod,  setEndPeriod]  = useState<'AM' | 'PM'>('AM');
+  const [endTimeSet, setEndTimeSet] = useState(false);
+
   // Upload state
   const [attachment,       setAttachment]       = useState<AttachedFile | null>(null);
   const [uploadDesc,       setUploadDesc]       = useState('');
@@ -279,6 +357,17 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
 
   const selectedCat    = options.find(c => c.id === categoryId) ?? options[0];
   const startTimeLabel = timeSet ? `${hour}:${minute} ${period}` : '--:-- --';
+  const endTimeLabel   = endTimeSet ? `${endHour}:${endMinute} ${endPeriod}` : '--:-- --';
+
+  // Informational only — shows the selected date's free gaps so David can
+  // see at a glance what's open before picking a time. Excludes the task
+  // currently being edited so it doesn't count its own slot as occupied.
+  const openSlots = useMemo(() => {
+    if (!date || !existingTasks) return [];
+    const iso = toISODate(date);
+    const dayTasks = existingTasks.filter(t => t.date === iso && t.id !== editingTask?.id);
+    return computeOpenSlots(dayTasks);
+  }, [date, existingTasks, editingTask]);
 
   useEffect(() => {
     if (!options.some(c => c.id === categoryId)) setCategoryId(options[0]?.id ?? '');
@@ -297,7 +386,7 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
       setTitle(editingTask.title);
       setCategoryId(editingTask.categoryId ?? OPEN_CATEGORY_ID);
       setDuration(editingTask.durationMinutes ? String(editingTask.durationMinutes) : '');
-      setDate(new Date(`${editingTask.date}T00:00:00`));
+      setDate(editingTask.date ? new Date(`${editingTask.date}T00:00:00`) : null);
       if (editingTask.scheduledTime) {
         const [hh, mm] = editingTask.scheduledTime.split(':');
         const h24 = parseInt(hh, 10);
@@ -307,8 +396,25 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
         setMinute(mm);
         setPeriod(ap);
         setTimeSet(true);
+
+        // Pre-fill the end time from start + duration so editing shows the
+        // same range that was used to set the duration in the first place.
+        if (editingTask.durationMinutes) {
+          const endTotal = (h24 * 60 + parseInt(mm, 10) + editingTask.durationMinutes) % (24 * 60);
+          const endH24 = Math.floor(endTotal / 60);
+          const endM = endTotal % 60;
+          const endAp: 'AM' | 'PM' = endH24 >= 12 ? 'PM' : 'AM';
+          const endH12 = endH24 % 12 === 0 ? 12 : endH24 % 12;
+          setEndHour(endH12.toString().padStart(2, '0'));
+          setEndMinute(endM.toString().padStart(2, '0'));
+          setEndPeriod(endAp);
+          setEndTimeSet(true);
+        } else {
+          setEndTimeSet(false);
+        }
       } else {
         setTimeSet(false);
+        setEndTimeSet(false);
       }
     } else {
       setDate(initialDate ? new Date(`${initialDate}T00:00:00`) : new Date());
@@ -327,6 +433,7 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
     setTitle(''); setDuration(''); setIsRecurring(false);
     setRepeatType('daily'); setInterval('1'); setSelectedDays(new Set());
     setHour('08'); setMinute('00'); setPeriod('AM'); setTimeSet(false);
+    setEndHour('08'); setEndMinute('30'); setEndPeriod('AM'); setEndTimeSet(false);
     setPanel('main');
     setAttachment(null); setUploadDesc(''); setSuggestedTasks([]);
   };
@@ -407,7 +514,7 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
     const payload: NewTask = {
       title:       title.trim(),
       categoryId,
-      date:        toISODate(date),
+      date:        date ? toISODate(date) : '',
       startTime:   timeSet ? `${hour}:${minute} ${period}` : '',
       duration,
       isRecurring,
@@ -421,7 +528,22 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
   };
 
   const confirmTime = () => { setTimeSet(true);  setPanel('main'); };
-  const clearTime   = () => { setTimeSet(false); setPanel('main'); };
+  const clearTime   = () => { setTimeSet(false); setEndTimeSet(false); setPanel('main'); };
+  const clearDate   = () => { setDate(null); setPanel('main'); };
+
+  // Sets the end time and, if a start time is also set, derives duration
+  // from the gap between them (wrapping past midnight if needed).
+  const confirmEndTime = () => {
+    setEndTimeSet(true);
+    if (timeSet) {
+      const startMins = minutesOfDay(hour, minute, period);
+      const endMins   = minutesOfDay(endHour, endMinute, endPeriod);
+      const diff = ((endMins - startMins) % (24 * 60) + 24 * 60) % (24 * 60);
+      setDuration(String(diff || 24 * 60));
+    }
+    setPanel('main');
+  };
+  const clearEndTime = () => { setEndTimeSet(false); setPanel('main'); };
 
   return (
     <Modal visible={visible} transparent animationType="slide" statusBarTranslucent>
@@ -480,21 +602,48 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
               )}
 
               {/* DATE */}
-              <TouchableOpacity style={s.dateField} onPress={() => setPanel('date')} activeOpacity={0.8}>
-                <Text style={s.dateFieldTxt}>{dateLabel(date)}</Text>
-                <Calendar size={13} color={MUTED} strokeWidth={1.5} />
-              </TouchableOpacity>
+              <View style={s.dateRow}>
+                <TouchableOpacity style={[s.dateField, { flex: 1 }]} onPress={() => setPanel('date')} activeOpacity={0.8}>
+                  <Text style={[s.dateFieldTxt, !date && s.startTimePlaceholder]}>{dateLabel(date)}</Text>
+                  <Calendar size={13} color={MUTED} strokeWidth={1.5} />
+                </TouchableOpacity>
+                {date && (
+                  <TouchableOpacity style={s.iconBtn} onPress={clearDate} activeOpacity={0.7}>
+                    <X size={14} color={INK} strokeWidth={1.5} />
+                  </TouchableOpacity>
+                )}
+              </View>
 
-              {/* START TIME + DURATION */}
+              {/* OPEN SLOTS — informational, not tappable */}
+              {date && openSlots.length > 0 && (
+                <View style={{ gap: 6 }}>
+                  <Text style={s.fieldLabel}>OPEN ON {dateLabel(date).toUpperCase()}</Text>
+                  <View style={s.slotWrap}>
+                    {openSlots.map((slot, i) => (
+                      <View key={i} style={s.slotChip}>
+                        <Text style={s.slotChipTxt}>{minutesToLabel(slot.start)} – {minutesToLabel(slot.end)}</Text>
+                      </View>
+                    ))}
+                  </View>
+                </View>
+              )}
+
+              {/* START TIME + END TIME + DURATION */}
               <View style={s.timeRow}>
                 <TouchableOpacity style={s.startTimeField} onPress={() => setPanel('time')} activeOpacity={0.8}>
+                  <Text style={s.fieldLabel}>START</Text>
                   <Text style={[s.startTimeTxt, !timeSet && s.startTimePlaceholder]}>
                     {startTimeLabel}
                   </Text>
-                  <Clock size={13} color={MUTED} strokeWidth={1.5} />
+                </TouchableOpacity>
+                <TouchableOpacity style={s.startTimeField} onPress={() => setPanel('endTime')} activeOpacity={0.8}>
+                  <Text style={s.fieldLabel}>END</Text>
+                  <Text style={[s.startTimeTxt, !endTimeSet && s.startTimePlaceholder]}>
+                    {endTimeLabel}
+                  </Text>
                 </TouchableOpacity>
                 <View style={s.durationWrap}>
-                  <Text style={s.fieldLabel}>DURATION</Text>
+                  <Text style={s.fieldLabel}>MINS</Text>
                   <TextInput
                     style={s.durationInput}
                     placeholder="45"
@@ -591,6 +740,39 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
             </>
           )}
 
+          {/* ── END TIME PICKER PANEL ── */}
+          {panel === 'endTime' && (
+            <>
+              <View style={s.panelHeader}>
+                <Text style={s.header}>END TIME</Text>
+                <TouchableOpacity onPress={() => setPanel('main')} activeOpacity={0.7}>
+                  <Text style={s.backTxt}>← BACK</Text>
+                </TouchableOpacity>
+              </View>
+
+              {timeSet && (
+                <Text style={s.endTimeHint}>Sets duration from {startTimeLabel} to the time you pick.</Text>
+              )}
+
+              <View style={s.pickerWrap}>
+                <View style={s.selHighlight} pointerEvents="none" />
+                <ScrollCol items={HOURS}   selected={endHour}   onSettle={setEndHour} />
+                <Text style={s.colon}>:</Text>
+                <ScrollCol items={MINUTES} selected={endMinute} onSettle={setEndMinute} />
+                <ScrollCol items={PERIODS} selected={endPeriod} onSettle={v => setEndPeriod(v as 'AM' | 'PM')} />
+              </View>
+
+              <View style={s.btnRow}>
+                <TouchableOpacity style={s.addBtn} onPress={confirmEndTime} activeOpacity={0.8}>
+                  <Text style={s.addBtnTxt}>SET END TIME</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={s.cancelBtn} onPress={clearEndTime} activeOpacity={0.7}>
+                  <Text style={s.cancelBtnTxt}>CLEAR</Text>
+                </TouchableOpacity>
+              </View>
+            </>
+          )}
+
           {/* ── DATE PICKER PANEL ── */}
           {panel === 'date' && (
             <>
@@ -601,9 +783,17 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
                 </TouchableOpacity>
               </View>
               <InlineCalendar
-                selectedDate={date}
+                selectedDate={date ?? new Date()}
                 onSelectDate={d => { setDate(d); setPanel('main'); }}
               />
+              {/* InlineCalendar has its own marginHorizontal on top of the sheet's
+                  padding — match that extra inset here so this button lines up
+                  with the calendar's edges instead of the wider sheet edges. */}
+              <View style={[s.btnRow, { marginHorizontal: MARGIN }]}>
+                <TouchableOpacity style={s.cancelBtn} onPress={clearDate} activeOpacity={0.7}>
+                  <Text style={s.cancelBtnTxt}>CLEAR DATE</Text>
+                </TouchableOpacity>
+              </View>
             </>
           )}
 
@@ -706,6 +896,7 @@ const s = StyleSheet.create({
   iconBtn:       { width: 40, height: 40, borderWidth: BORDER, borderColor: INK, borderRadius: 2, alignItems: 'center', justifyContent: 'center' },
   iconBtnActive: { backgroundColor: INK },
 
+  dateRow:   { flexDirection: 'row', gap: 8, alignItems: 'center' },
   dateField: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
     borderWidth: BORDER, borderColor: INK, borderRadius: 2,
@@ -713,19 +904,19 @@ const s = StyleSheet.create({
   },
   dateFieldTxt: { fontFamily: 'VT323', fontSize: 18, color: INK, lineHeight: 22 },
 
-  timeRow:     { flexDirection: 'row', gap: 10, alignItems: 'flex-end' },
+  timeRow:     { flexDirection: 'row', gap: 8, alignItems: 'flex-end' },
   startTimeField: {
-    flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    flex: 1, gap: 4, justifyContent: 'center',
     borderWidth: BORDER, borderColor: INK, borderRadius: 2,
     paddingHorizontal: 10, height: 44,
   },
-  startTimeTxt:         { fontFamily: 'VT323', fontSize: 18, color: INK, lineHeight: 22 },
+  startTimeTxt:         { fontFamily: 'VT323', fontSize: 16, color: INK, lineHeight: 19 },
   startTimePlaceholder: { color: MUTED },
-  durationWrap:  { width: 80, gap: 5 },
+  durationWrap:  { width: 64, gap: 5 },
   fieldLabel:    { fontFamily: 'PressStart2P', fontSize: 5, color: MUTED, lineHeight: 8 },
   durationInput: {
     height: 44, borderWidth: BORDER, borderColor: INK, borderRadius: 2,
-    paddingHorizontal: 10, fontFamily: 'VT323', fontSize: 18, color: INK, textAlign: 'center',
+    paddingHorizontal: 6, fontFamily: 'VT323', fontSize: 18, color: INK, textAlign: 'center',
   },
 
   btnRow:       { flexDirection: 'row', gap: 10 },
@@ -760,6 +951,12 @@ const s = StyleSheet.create({
   catOptionActive:  { backgroundColor: INK },
   catOptionTxt:     { fontFamily: 'VT323', fontSize: 18, color: INK, lineHeight: 20 },
   catOptionTxtActive: { color: BG },
+
+  endTimeHint: { fontFamily: 'VT323', fontSize: 15, color: MUTED, lineHeight: 18 },
+
+  slotWrap:    { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
+  slotChip:    { borderWidth: BORDER, borderColor: MUTED, borderRadius: 2, paddingHorizontal: 8, paddingVertical: 5 },
+  slotChipTxt: { fontFamily: 'VT323', fontSize: 14, color: INK, lineHeight: 16 },
 
   pickerWrap: {
     flexDirection: 'row', alignItems: 'center',
