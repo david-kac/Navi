@@ -7,6 +7,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter, useFocusEffect } from 'expo-router';
 import DotCharacter, { DotMood } from '../components/DotCharacter';
 import PartyView from '../components/PartyView';
+import BattleView from '../components/BattleView';
 import AddTaskModal, { NewTask, EditableTask, DayTaskSlot } from '../components/AddTaskModal';
 import type { SuggestedTask } from '../lib/ai';
 import TaskActionSheet from '../components/TaskActionSheet';
@@ -44,6 +45,7 @@ const MARGIN = 18;
 // ─── Types ─────────────────────────────────────────────────────────────────────
 type TimePeriod = 'morning' | 'afternoon' | 'evening' | 'unscheduled';
 type ActiveTab  = 'DAY' | 'CATS';
+type ActiveView = 'home' | 'party' | 'battle';
 
 interface Task {
   id:             string;
@@ -169,11 +171,13 @@ function StatusRow({ time }: { time: string }) {
 
 const BANNER_ACTIVE   = require('../assets/Party Active.png');
 const BANNER_INACTIVE = require('../assets/Party inactive.png');
+const SWORD_ACTIVE    = require('../assets/Battle active.png');
+const SWORD_INACTIVE  = require('../assets/Battle inactive.png');
 
 // ─── Dot + action buttons ──────────────────────────────────────────────────────
-function DotHeader({ mood, onAdd, onOpenChat, onLongPressDot, showParty, onToggleParty }: {
+function DotHeader({ mood, onAdd, onOpenChat, onLongPressDot, activeView, onToggleParty, onToggleBattle }: {
   mood: DotMood; onAdd: () => void; onOpenChat: () => void; onLongPressDot: () => void;
-  showParty: boolean; onToggleParty: () => void;
+  activeView: ActiveView; onToggleParty: () => void; onToggleBattle: () => void;
 }) {
   return (
     <View style={s.dotHeader}>
@@ -181,8 +185,11 @@ function DotHeader({ mood, onAdd, onOpenChat, onLongPressDot, showParty, onToggl
         <DotCharacter mood={mood} />
       </TouchableOpacity>
       <View style={s.dotBtns}>
-        <TouchableOpacity style={s.bannerBtn} onPress={onToggleParty} activeOpacity={0.7}>
-          <Image source={showParty ? BANNER_ACTIVE : BANNER_INACTIVE} style={s.bannerIcon} resizeMode="contain" />
+        <TouchableOpacity style={s.bannerBtn} onPress={onToggleBattle} activeOpacity={0.7}>
+          <Image source={activeView === 'battle' ? SWORD_ACTIVE : SWORD_INACTIVE} style={[s.bannerIcon, { marginLeft: 4 }]} resizeMode="contain" />
+        </TouchableOpacity>
+        <TouchableOpacity style={[s.bannerBtn, { marginRight: 4 }]} onPress={onToggleParty} activeOpacity={0.7}>
+          <Image source={activeView === 'party' ? BANNER_ACTIVE : BANNER_INACTIVE} style={s.bannerIcon} resizeMode="contain" />
         </TouchableOpacity>
         <TouchableOpacity style={s.dotBtn} onPress={onAdd} activeOpacity={0.7}><Plus size={15} color={INK} strokeWidth={2} /></TouchableOpacity>
       </View>
@@ -621,7 +628,7 @@ export default function HomeScreen() {
   const [selectedDate, setSelectedDate]= useState(new Date());
   const [actionTask,   setActionTask]  = useState<Task | null>(null);
   const [editingTask,  setEditingTask] = useState<Task | null>(null);
-  const [showParty,    setShowParty]   = useState(false);
+  const [activeView,   setActiveView]  = useState<ActiveView>('home');
 
   useEffect(() => {
     const id = setInterval(() => setTime(nowStr()), 30_000);
@@ -915,15 +922,18 @@ export default function HomeScreen() {
         onAdd={() => setShowAddTask(true)}
         onOpenChat={() => router.push('/dot-chat')}
         onLongPressDot={() => router.push('/settings')}
-        showParty={showParty}
-        onToggleParty={() => setShowParty(v => !v)}
+        activeView={activeView}
+        onToggleParty={() => setActiveView(v => v === 'party' ? 'home' : 'party')}
+        onToggleBattle={() => setActiveView(v => v === 'battle' ? 'home' : 'battle')}
       />
       <View style={s.divider} />
       <VerseCard verse={verse} />
 
       {/* ── Content ── */}
-      {showParty ? (
+      {activeView === 'party' ? (
         <PartyView userId={userId} />
+      ) : activeView === 'battle' ? (
+        <BattleView />
       ) : tab === 'DAY' && (
         <ScrollView style={s.tabContent} showsVerticalScrollIndicator={false}>
           <View style={s.todoWrap}><Text style={s.todoText}>TO-DO</Text></View>
@@ -959,7 +969,7 @@ export default function HomeScreen() {
           <View style={{ height: 32 }} />
         </ScrollView>
       )}
-      {!showParty && tab === 'CATS' && (
+      {activeView === 'home' && tab === 'CATS' && (
         <CatsView
           tab={tab}
           onTabChange={t => { setTab(t); setShowCal(false); }}
@@ -1028,10 +1038,10 @@ const s = StyleSheet.create({
   statusDot:  { fontFamily: 'PressStart2P', fontSize: 7, color: INK,  lineHeight: 11 },
 
   dotHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: MARGIN, paddingTop: 6, paddingBottom: 6 },
-  dotBtns:   { flexDirection: 'row', gap: 6 },
+  dotBtns:   { flexDirection: 'row', alignItems: 'center', gap: 14 },
   dotBtn:    { width: 36, height: 36, borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, alignItems: 'center', justifyContent: 'center', backgroundColor: BG },
   bannerIcon: { width: 30, height: 30 },
-  bannerBtn:  { width: 36, height: 36, alignItems: 'center', justifyContent: 'center', marginRight: 8 },
+  bannerBtn:  { width: 36, height: 36, alignItems: 'center', justifyContent: 'center' },
 
   divider:     { height: DASH, backgroundColor: INK },
   tabUnderline:{ height: DASH, backgroundColor: INK, marginTop: 10 },
