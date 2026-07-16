@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity,
-  StyleSheet, Image, TextInput,
+  StyleSheet, Image, TextInput, Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter, useFocusEffect } from 'expo-router';
@@ -20,6 +20,7 @@ import type { Database } from '../lib/database.types';
 import { getTimePeriod } from '../lib/database.types';
 import { generateTasksForDate, deleteRecurringOccurrence, deleteRecurringSeries } from '../lib/recurring';
 import { shouldShowMorningFlow } from '../lib/morningGate';
+import { shouldRunDailyCleanup, markDailyCleanupRun } from '../lib/taskCleanup';
 import { getVerseOfTheDay, Verse } from '../lib/verseOfTheDay';
 
 type TaskRow = Database['public']['Tables']['tasks']['Row'];
@@ -37,6 +38,7 @@ const BG     = '#FEFEFE';
 const MUTED  = '#8A8480';
 const OLIVE  = '#7A8B5A';
 const GREEN  = '#4DB860';
+const RED    = '#C0392B';
 const BORDER = 1.354;
 const DASH   = 0.677;
 const RADIUS = 4;
@@ -90,6 +92,26 @@ function toISODate(d: Date): string {
 // within the window.
 function inCatWindow(date: string | null, todayISO: string, catEndISO: string): boolean {
   return date === null || (date >= todayISO && date <= catEndISO);
+}
+
+// Sentinel that sorts after every real "HH:MM:SS" string, so unscheduled
+// tasks (no start time) always land last within their group.
+const timeSortKey = (t?: string) => t ?? '99:99:99';
+
+// Keeps the Day view's task list chronological by start time immediately
+// after an add/edit, instead of waiting for the next full reload to re-sort.
+function sortByTime(list: Task[]): Task[] {
+  return [...list].sort((a, b) => timeSortKey(a.scheduledTime).localeCompare(timeSortKey(b.scheduledTime)));
+}
+
+// Same idea for the Categories tab's 30-day window, which is grouped by
+// date first (dateless tasks sort last), then by start time within a date.
+function sortByDateThenTime(list: Task[]): Task[] {
+  return [...list].sort((a, b) => {
+    const ad = a.date ?? '9999-99-99';
+    const bd = b.date ?? '9999-99-99';
+    return ad !== bd ? ad.localeCompare(bd) : timeSortKey(a.scheduledTime).localeCompare(timeSortKey(b.scheduledTime));
+  });
 }
 
 // Converts AddTaskModal's "08:00 AM" label to a Postgres `time` literal.
@@ -362,19 +384,21 @@ interface CatsViewProps {
   onToggleTask: (id: string) => void;
   onLongPressTask: (task: Task) => void;
   onAddTask: (categoryId: string, title: string) => void;
-  onAddCategory: (name: string, icon: string) => void;
+  onAddCategory: (name: string, icon: string) => Promise<{ success: boolean; message?: string }>;
   onEditCategory: (id: string, name: string, icon: string) => void;
   onDeleteCategory: (id: string) => void;
+  onDeleteCompleted: () => void;
 }
 
 function CatsView({
   tab, onTabChange, categories, tasks,
-  onToggleTask, onLongPressTask, onAddTask, onAddCategory, onEditCategory, onDeleteCategory,
+  onToggleTask, onLongPressTask, onAddTask, onAddCategory, onEditCategory, onDeleteCategory, onDeleteCompleted,
 }: CatsViewProps) {
   const [expanded,    setExpanded]    = useState<Set<string>>(new Set());
   const [showNew,     setShowNew]     = useState(false);
   const [newName,     setNewName]     = useState('');
   const [selIcon,     setSelIcon]     = useState(0);
+  const [savingCat,   setSavingCat]   = useState(false);
   const [draftTitles, setDraftTitles] = useState<Record<string, string>>({});
   const [categoryActionId, setCategoryActionId] = useState<string | null>(null);
   const categoryAction = categories.find(c => c.id === categoryActionId) ?? null;
@@ -404,6 +428,26 @@ function CatsView({
     if (!title) return;
     onAddTask(categoryId, title);
     setDraftTitles(prev => ({ ...prev, [categoryId]: '' }));
+  };
+
+  const submitNewCategory = async () => {
+    const name = newName.trim();
+    if (!name || savingCat) return;
+    setSavingCat(true);
+    const result = await onAddCategory(name, CAT_ICON_GRID[selIcon]);
+    setSavingCat(false);
+    if (!result.success) {
+      Alert.alert('Could not create category', result.message ?? 'Something went wrong.');
+      return;
+    }
+    setShowNew(false); setNewName(''); setSelIcon(0);
+  };
+
+  const confirmDeleteCompleted = () => {
+    Alert.alert('Delete all completed tasks?', undefined, [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete', style: 'destructive', onPress: onDeleteCompleted },
+    ]);
   };
 
   return (
@@ -496,7 +540,14 @@ function CatsView({
       {!editingCatId && (
         <TouchableOpacity style={s.newCatTrigger} onPress={() => setShowNew(!showNew)} activeOpacity={0.7}>
           <Plus size={12} color={INK} strokeWidth={2} />
-          <Text style={s.newCatTriggerTxt}>+ NEW CATEGORY</Text>
+          <Text style={s.newCatTriggerTxt}>NEW CATEGORY</Text>
+        </TouchableOpacity>
+      )}
+
+      {/* DELETE ALL COMPLETED TASKS */}
+      {!editingCatId && (
+        <TouchableOpacity style={s.deleteCompletedTrigger} onPress={confirmDeleteCompleted} activeOpacity={0.7}>
+          <Text style={s.deleteCompletedTxt}>DELETE ALL COMPLETED TASKS</Text>
         </TouchableOpacity>
       )}
 
@@ -526,15 +577,12 @@ function CatsView({
           </View>
           <View style={s.newCatActions}>
             <TouchableOpacity
-              style={s.newCatAdd}
-              onPress={() => {
-                if (!newName.trim()) return;
-                onAddCategory(newName.trim(), CAT_ICON_GRID[selIcon]);
-                setShowNew(false); setNewName(''); setSelIcon(0);
-              }}
+              style={[s.newCatAdd, savingCat && { opacity: 0.5 }]}
+              onPress={submitNewCategory}
+              disabled={savingCat}
               activeOpacity={0.8}
             >
-              <Text style={s.newCatAddTxt}>ADD</Text>
+              <Text style={s.newCatAddTxt}>{savingCat ? 'SAVING…' : 'ADD'}</Text>
             </TouchableOpacity>
             <TouchableOpacity style={s.newCatClose} onPress={() => setShowNew(false)} activeOpacity={0.7}>
               <X size={14} color={INK} strokeWidth={2} />
@@ -684,15 +732,19 @@ export default function HomeScreen() {
   }, [userId]);
 
 
-  const addCategory = useCallback(async (name: string, icon: string) => {
-    if (!userId) return;
+  const addCategory = useCallback(async (name: string, icon: string): Promise<{ success: boolean; message?: string }> => {
+    if (!userId) return { success: false, message: 'Not signed in.' };
     const { data, error } = await supabase
       .from('categories')
       .insert({ user_id: userId, name, icon })
       .select('*')
       .single();
-    if (error || !data) { console.error(error); return; }
+    if (error || !data) {
+      console.error(error);
+      return { success: false, message: error?.code === '23505' ? `A category named "${name}" already exists.` : (error?.message ?? 'Failed to create category.') };
+    }
     setCategories(prev => [...prev, data]);
+    return { success: true };
   }, [userId]);
 
   const updateCategory = useCallback(async (id: string, name: string, icon: string) => {
@@ -708,6 +760,31 @@ export default function HomeScreen() {
     const { error } = await supabase.from('categories').delete().eq('id', id);
     if (error) console.error(error);
   }, []);
+
+  // Shared by the manual "Delete all completed tasks" button and the
+  // once-per-day auto-cleanup effect below — deletes every completed task
+  // for this user regardless of date, not just what's currently loaded.
+  const deleteCompletedTasks = useCallback(async () => {
+    if (!userId) return;
+    const { error } = await supabase.from('tasks').delete().eq('user_id', userId).eq('is_completed', true);
+    if (error) { console.error(error); return; }
+    setTasks(prev => prev.filter(t => !t.isCompleted));
+    setCatTasks(prev => prev.filter(t => !t.isCompleted));
+  }, [userId]);
+
+  // Once per calendar day (checked on app open, same gating pattern as the
+  // morning-flow greeting in lib/morningGate.ts), sweep any tasks left
+  // marked complete from a previous day so they don't pile up indefinitely.
+  // Gated so a task checked off today stays visible (with strikethrough)
+  // for the rest of today — it's only swept the next time the app opens.
+  useEffect(() => {
+    if (!userId) return;
+    shouldRunDailyCleanup().then(async should => {
+      if (!should) return;
+      await deleteCompletedTasks();
+      await markDailyCleanupRun();
+    });
+  }, [userId, deleteCompletedTasks]);
 
   const categoriesWithOpen = useMemo(() => [...categories, OPEN_CATEGORY], [categories]);
 
@@ -810,18 +887,18 @@ export default function HomeScreen() {
     if (error || !row) { console.error(error); return; }
 
     if (row.date === toISODate(selectedDate)) {
-      setTasks(prev => prev.map(t => t.id === id ? rowToTask(row) : t));
+      setTasks(prev => sortByTime(prev.map(t => t.id === id ? rowToTask(row) : t)));
     } else {
       setTasks(prev => prev.filter(t => t.id !== id));
     }
     const today = toISODate(new Date());
     const catEnd = new Date(); catEnd.setDate(catEnd.getDate() + 30);
     if (inCatWindow(row.date, today, toISODate(catEnd))) {
-      setCatTasks(prev =>
+      setCatTasks(prev => sortByDateThenTime(
         prev.some(t => t.id === id)
           ? prev.map(t => t.id === id ? rowToTask(row) : t)
           : [...prev, rowToTask(row)]
-      );
+      ));
     } else {
       setCatTasks(prev => prev.filter(t => t.id !== id));
     }
@@ -870,12 +947,12 @@ export default function HomeScreen() {
     if (error || !row) { console.error(error); return; }
 
     if (row.date === toISODate(selectedDate)) {
-      setTasks(prev => [...prev, rowToTask(row)]);
+      setTasks(prev => sortByTime([...prev, rowToTask(row)]));
     }
     const today = toISODate(new Date());
     const catEnd = new Date(); catEnd.setDate(catEnd.getDate() + 30);
     if (inCatWindow(row.date, today, toISODate(catEnd))) {
-      setCatTasks(prev => [...prev, rowToTask(row)]);
+      setCatTasks(prev => sortByDateThenTime([...prev, rowToTask(row)]));
     }
   }, [userId, selectedDate]);
 
@@ -902,10 +979,10 @@ export default function HomeScreen() {
         .single();
       if (error || !row) { console.error(error); continue; }
       if (row.date === toISODate(selectedDate)) {
-        setTasks(prev => [...prev, rowToTask(row)]);
+        setTasks(prev => sortByTime([...prev, rowToTask(row)]));
       }
       if (inCatWindow(row.date, today, toISODate(catEnd))) {
-        setCatTasks(prev => [...prev, rowToTask(row)]);
+        setCatTasks(prev => sortByDateThenTime([...prev, rowToTask(row)]));
       }
     }
   }, [userId, categories, selectedDate]);
@@ -981,6 +1058,7 @@ export default function HomeScreen() {
           onAddCategory={addCategory}
           onEditCategory={updateCategory}
           onDeleteCategory={removeCategory}
+          onDeleteCompleted={deleteCompletedTasks}
         />
       )}
 
@@ -1142,6 +1220,13 @@ const s = StyleSheet.create({
     borderWidth: DASH, borderStyle: 'dashed', borderColor: INK, borderRadius: RADIUS, gap: 8,
   },
   newCatTriggerTxt: { fontFamily: 'PressStart2P', fontSize: 7, color: INK, lineHeight: 11 },
+
+  deleteCompletedTrigger: {
+    alignItems: 'center', justifyContent: 'center',
+    marginHorizontal: MARGIN, marginTop: 8, paddingVertical: 13,
+    borderWidth: DASH, borderStyle: 'dashed', borderColor: RED, borderRadius: RADIUS,
+  },
+  deleteCompletedTxt: { fontFamily: 'PressStart2P', fontSize: 7, color: RED, lineHeight: 11 },
 
   newCatCard:      { marginHorizontal: MARGIN, marginTop: 10, borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, padding: 14, gap: 12 },
   newCatLabel:     { fontFamily: 'PressStart2P', fontSize: 6, color: MUTED, lineHeight: 9 },

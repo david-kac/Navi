@@ -214,6 +214,15 @@ export default function DotChat() {
       return { success: false, message: "Failed to update task: couldn't find a task matching that id or title." };
     }
 
+    const { data: current, error: currentError } = await supabase
+      .from('tasks')
+      .select('title, date, scheduled_time, duration_minutes')
+      .eq('id', realId)
+      .single();
+    if (currentError || !current) {
+      return { success: false, message: `Failed to update task: ${currentError?.message ?? 'not found'}` };
+    }
+
     const patch: Database['public']['Tables']['tasks']['Update'] = {};
     if (taskInput.title !== undefined) patch.title = taskInput.title;
     if (taskInput.clearDate) {
@@ -234,6 +243,48 @@ export default function DotChat() {
       patch.category_id = matched?.id ?? null;
     }
 
+    // Moving to a different day — check the destination day's existing
+    // schedule for overlaps before writing, instead of silently double
+    // booking it. Only relevant if the moved task ends up with both a time
+    // and a duration (carried over from the current row if not also changing).
+    const movingToNewDay = patch.date !== undefined && patch.date !== null && patch.date !== current.date;
+    if (movingToNewDay && userId) {
+      const destTime     = patch.scheduled_time !== undefined ? patch.scheduled_time : current.scheduled_time;
+      const destDuration = patch.duration_minutes !== undefined ? patch.duration_minutes : current.duration_minutes;
+      if (destTime && destDuration) {
+        const { data: destRows } = await supabase
+          .from('tasks')
+          .select('id, title, scheduled_time, duration_minutes, time_period')
+          .eq('user_id', userId)
+          .eq('date', patch.date as string)
+          .neq('id', realId);
+
+        const slots: TaskSlot[] = [
+          ...(destRows ?? []).map(r => ({
+            id: r.id, title: r.title,
+            scheduledTime: r.scheduled_time ?? undefined,
+            durationMinutes: r.duration_minutes ?? undefined,
+            timePeriod: r.time_period,
+          })),
+          { id: realId, title: patch.title ?? current.title, scheduledTime: destTime, durationMinutes: destDuration, timePeriod: getTimePeriod(destTime) },
+        ];
+        const destIsThursday = new Date(`${patch.date}T00:00:00`).getDay() === 4;
+        const overlaps = detectConflicts(slots, destIsThursday).filter(c => c.type === 'overlap' && c.taskIds.includes(realId));
+
+        if (overlaps.length) {
+          const otherTitles = overlaps
+            .flatMap(o => o.taskIds)
+            .filter(id => id !== realId)
+            .map(id => (destRows ?? []).find(r => r.id === id)?.title)
+            .filter((t): t is string => !!t);
+          return {
+            success: false,
+            message: `Can't move "${patch.title ?? current.title}" to ${patch.date} at ${fmt12(destTime)} — it overlaps with ${otherTitles.join(' and ')} already scheduled that day. Do not move it. Instead propose a different open time on ${patch.date} and wait for David to confirm before calling update_task again.`,
+          };
+        }
+      }
+    }
+
     const { data: row, error } = await supabase
       .from('tasks')
       .update(patch)
@@ -247,7 +298,7 @@ export default function DotChat() {
     }
     setDisplay(prev => [...prev, { id: `updated-${Date.now()}`, kind: 'added', text: `✎ Updated "${row.title}"` }]);
     return { success: true, message: 'Task updated successfully.' };
-  }, [categories, resolveTaskId]);
+  }, [categories, resolveTaskId, userId]);
 
   const executeDeleteTask = useCallback(async (taskInput: DeleteTaskToolInput): Promise<{ success: boolean; message: string }> => {
     const realId = await resolveTaskId(taskInput.taskId, taskInput.currentTitle, taskInput.currentDate);
