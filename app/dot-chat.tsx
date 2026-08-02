@@ -14,7 +14,7 @@ import { analyzeAssetAndSuggestTasks, SuggestedTask, AssetMimeType } from '../li
 import TaskPreviewModal from '../components/TaskPreviewModal';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../lib/AuthProvider';
-import { buildDotSystemPrompt, runPlannerTurn, AnthropicMessage, AddTaskToolInput, UpdateTaskToolInput, DeleteTaskToolInput } from '../lib/ai';
+import { buildDotSystemPrompt, runPlannerTurn, AnthropicMessage, AddTaskToolInput, UpdateTaskToolInput, DeleteTaskToolInput, AddCategoryToolInput, LookupPastTasksToolInput } from '../lib/ai';
 import { detectConflicts, Conflict, TaskSlot } from '../lib/conflicts';
 import { generateTasksForDate } from '../lib/recurring';
 import { shouldShowMorningFlow, markMorningFlowShown } from '../lib/morningGate';
@@ -127,6 +127,11 @@ export default function DotChat() {
   const [stage, setStage] = useState<Stage>('loading');
   const [display, setDisplay] = useState<DisplayMessage[]>([]);
   const [categories, setCategories] = useState<CategoryRow[]>([]);
+  // Mirrors `categories` but updated synchronously (not just on next render)
+  // so a category created earlier in the same tool-call round is
+  // immediately matchable by add_task/update_task later in that same round.
+  const categoriesRef = useRef<CategoryRow[]>([]);
+  useEffect(() => { categoriesRef.current = categories; }, [categories]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [conflicts, setConflicts] = useState<Conflict[]>([]);
@@ -160,7 +165,7 @@ export default function DotChat() {
     if (!userId) return { success: false, message: 'Not signed in.' };
 
     const matchedCategory = taskInput.categoryName
-      ? categories.find(c => c.name.toLowerCase() === taskInput.categoryName!.toLowerCase())
+      ? categoriesRef.current.find(c => c.name.toLowerCase() === taskInput.categoryName!.toLowerCase())
       : undefined;
     const date = taskInput.date && /^\d{4}-\d{2}-\d{2}$/.test(taskInput.date) ? taskInput.date : toISODate(new Date());
     const scheduledTime = taskInput.scheduledTime ? `${taskInput.scheduledTime}:00` : null;
@@ -206,7 +211,7 @@ export default function DotChat() {
     }
     setDisplay(prev => [...prev, { id: `added-${Date.now()}`, kind: 'added', text: `+ Added "${taskInput.title}"${date !== toISODate(new Date()) ? ` for ${date}` : ''}${recurringRuleId ? ' (recurring)' : ''}` }]);
     return { success: true, message: 'Task added successfully.' };
-  }, [userId, categories]);
+  }, [userId]);
 
   const executeUpdateTask = useCallback(async (taskInput: UpdateTaskToolInput): Promise<{ success: boolean; message: string }> => {
     const realId = await resolveTaskId(taskInput.taskId, taskInput.currentTitle, taskInput.currentDate);
@@ -239,7 +244,7 @@ export default function DotChat() {
     }
     if (taskInput.durationMinutes !== undefined) patch.duration_minutes = taskInput.durationMinutes;
     if (taskInput.categoryName !== undefined) {
-      const matched = categories.find(c => c.name.toLowerCase() === taskInput.categoryName!.toLowerCase());
+      const matched = categoriesRef.current.find(c => c.name.toLowerCase() === taskInput.categoryName!.toLowerCase());
       patch.category_id = matched?.id ?? null;
     }
 
@@ -298,7 +303,7 @@ export default function DotChat() {
     }
     setDisplay(prev => [...prev, { id: `updated-${Date.now()}`, kind: 'added', text: `✎ Updated "${row.title}"` }]);
     return { success: true, message: 'Task updated successfully.' };
-  }, [categories, resolveTaskId, userId]);
+  }, [resolveTaskId, userId]);
 
   const executeDeleteTask = useCallback(async (taskInput: DeleteTaskToolInput): Promise<{ success: boolean; message: string }> => {
     const realId = await resolveTaskId(taskInput.taskId, taskInput.currentTitle, taskInput.currentDate);
@@ -332,6 +337,60 @@ export default function DotChat() {
       ? `Found ${fresh.length} conflict(s): ${fresh.map(c => c.message).join(' ')}`
       : 'No conflicts found — schedule looks clear.';
     return { success: true, message };
+  }, [userId]);
+
+  const executeAddCategory = useCallback(async (input: AddCategoryToolInput): Promise<{ success: boolean; message: string }> => {
+    if (!userId) return { success: false, message: 'Not signed in.' };
+    const name = input.name.trim();
+    if (!name) return { success: false, message: 'Category name cannot be empty.' };
+
+    const existing = categoriesRef.current.find(c => c.name.toLowerCase() === name.toLowerCase());
+    if (existing) return { success: true, message: `A category named "${name}" already exists — using that one.` };
+
+    const { data, error } = await supabase
+      .from('categories')
+      .insert({ user_id: userId, name, icon: 'Circle' })
+      .select('*')
+      .single();
+    if (error || !data) {
+      console.error(error);
+      return { success: false, message: error?.code === '23505' ? `A category named "${name}" already exists.` : `Failed to create category: ${error?.message ?? 'unknown error'}` };
+    }
+    categoriesRef.current = [...categoriesRef.current, data];
+    setCategories(prev => [...prev, data]);
+    setDisplay(prev => [...prev, { id: `cat-${Date.now()}`, kind: 'added', text: `+ Created category "${name}"` }]);
+    return { success: true, message: 'Category created successfully.' };
+  }, [userId]);
+
+  const executeLookupPastTasks = useCallback(async (input: LookupPastTasksToolInput): Promise<{ success: boolean; message: string }> => {
+    if (!userId) return { success: false, message: 'Not signed in.' };
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(input.startDate)) {
+      return { success: false, message: 'Invalid startDate — must be YYYY-MM-DD.' };
+    }
+    const endDate = input.endDate && /^\d{4}-\d{2}-\d{2}$/.test(input.endDate) ? input.endDate : input.startDate;
+
+    const { data, error } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('user_id', userId)
+      .gte('date', input.startDate)
+      .lte('date', endDate)
+      .order('date', { ascending: true })
+      .order('scheduled_time', { ascending: true });
+    if (error) {
+      console.error(error);
+      return { success: false, message: `Failed to look up past tasks: ${error.message}` };
+    }
+
+    const rows = (data ?? []) as TaskRow[];
+    if (!rows.length) return { success: true, message: `No tasks found between ${input.startDate} and ${endDate}.` };
+
+    const lines = rows.map(r => {
+      const when = r.scheduled_time ? fmt12(r.scheduled_time) : 'unscheduled';
+      const status = r.is_ttfo ? 'undecided' : r.is_completed ? 'done' : 'not done';
+      return `- ${r.date} — ${r.title} — ${when} (${status})`;
+    }).join('\n');
+    return { success: true, message: lines };
   }, [userId]);
 
   const pickPhoto = async () => {
@@ -426,6 +485,7 @@ export default function DotChat() {
     setMode(sessionMode);
 
     const { data: catRows } = await supabase.from('categories').select('*').eq('user_id', userId);
+    categoriesRef.current = catRows ?? [];
     setCategories(catRows ?? []);
 
     const { rows: todayRows, conflicts: detected } = await fetchTodayState(userId, today);
@@ -486,7 +546,7 @@ export default function DotChat() {
 
     setSending(true);
     try {
-      const result = await runPlannerTurn(system, [], kickoff, { executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule });
+      const result = await runPlannerTurn(system, [], kickoff, { executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule, executeAddCategory, executeLookupPastTasks });
       historyRef.current = result.history;
       setDisplay(prev => [...prev, { id: 'greet', kind: 'dot', text: result.replyText }]);
       setStage('chatting');
@@ -496,7 +556,7 @@ export default function DotChat() {
     } finally {
       setSending(false);
     }
-  }, [userId, modeParam, executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule]);
+  }, [userId, modeParam, executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule, executeAddCategory, executeLookupPastTasks]);
 
   useEffect(() => { greet(); }, [userId, modeParam]);
 
@@ -521,7 +581,7 @@ export default function DotChat() {
     setInput('');
     setSending(true);
     try {
-      const result = await runPlannerTurn(systemPromptRef.current, historyRef.current, text, { executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule });
+      const result = await runPlannerTurn(systemPromptRef.current, historyRef.current, text, { executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule, executeAddCategory, executeLookupPastTasks });
       historyRef.current = result.history;
       setDisplay(prev => [...prev, { id: `a-${Date.now()}`, kind: 'dot', text: result.replyText }]);
     } catch (e) {

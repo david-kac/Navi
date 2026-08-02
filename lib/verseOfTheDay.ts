@@ -73,7 +73,13 @@ export async function getVerseOfTheDay(): Promise<Verse> {
   }
 
   const fresh = await fetchFromFeed();
-  const verse = fresh ?? FALLBACK_VERSE;
-  await AsyncStorage.setItem(CACHE_KEY, JSON.stringify({ date: today, verse }));
-  return verse;
+  if (fresh) {
+    await AsyncStorage.setItem(CACHE_KEY, JSON.stringify({ date: today, verse: fresh }));
+    return fresh;
+  }
+  // Feed unreachable (e.g. no signal during the morning commute) — return the
+  // fallback for now, but deliberately don't cache it as "today's verse".
+  // The next call this same day (next screen focus, next app open) will
+  // retry the network instead of being stuck on the fallback all day.
+  return FALLBACK_VERSE;
 }

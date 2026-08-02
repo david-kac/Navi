@@ -20,7 +20,7 @@ import type { Database } from '../lib/database.types';
 import { getTimePeriod } from '../lib/database.types';
 import { generateTasksForDate, deleteRecurringOccurrence, deleteRecurringSeries } from '../lib/recurring';
 import { shouldShowMorningFlow } from '../lib/morningGate';
-import { shouldRunDailyCleanup, markDailyCleanupRun } from '../lib/taskCleanup';
+import { shouldRunDailyCleanup, markDailyCleanupRun, shouldRunStaleDateSweep, markStaleDateSweepRun } from '../lib/taskCleanup';
 import { getVerseOfTheDay, Verse } from '../lib/verseOfTheDay';
 
 type TaskRow = Database['public']['Tables']['tasks']['Row'];
@@ -85,13 +85,6 @@ function toISODate(d: Date): string {
   const m = (d.getMonth() + 1).toString().padStart(2, '0');
   const day = d.getDate().toString().padStart(2, '0');
   return `${y}-${m}-${day}`;
-}
-
-// A dateless task always belongs in the Categories tab's 30-day window (it
-// has no date to fall outside of); a dated task only belongs if it falls
-// within the window.
-function inCatWindow(date: string | null, todayISO: string, catEndISO: string): boolean {
-  return date === null || (date >= todayISO && date <= catEndISO);
 }
 
 // Sentinel that sorts after every real "HH:MM:SS" string, so unscheduled
@@ -683,10 +676,6 @@ export default function HomeScreen() {
     return () => clearInterval(id);
   }, []);
 
-  useEffect(() => {
-    getVerseOfTheDay().then(setVerse);
-  }, []);
-
   // First thing each morning (after 5am), jump straight into Dot's morning
   // greeting/verse/summary flow instead of waiting for a tap.
   useEffect(() => {
@@ -814,19 +803,16 @@ export default function HomeScreen() {
     setTasks((data ?? []).map(rowToTask));
   }, [userId, selectedDate]);
 
-  // Load tasks for the next 30 days — used by the Categories tab so it shows
-  // upcoming tasks across all dates, not just the selected day. Also pulls in
-  // fully dateless tasks (cleared via edit) so they don't disappear from the
-  // app entirely — Categories is their only home since Day view is per-date.
+  // Loads every task for this user — used by the Categories tab so a
+  // category shows all of its tasks (past, present, future, or dateless),
+  // not just what falls in some window. Day view is still per-date; this is
+  // the only place past-due and fully dateless tasks are ever visible.
   const loadCatTasks = useCallback(async () => {
     if (!userId) return;
-    const today = toISODate(new Date());
-    const end = new Date(); end.setDate(end.getDate() + 30);
     const { data, error } = await supabase
       .from('tasks')
       .select('*')
       .eq('user_id', userId)
-      .or(`date.is.null,and(date.gte.${today},date.lte.${toISODate(end)})`)
       .order('date', { ascending: true })
       .order('scheduled_time', { ascending: true });
     if (error) { console.error(error); return; }
@@ -838,8 +824,35 @@ export default function HomeScreen() {
       loadCategories();
       loadTasks();
       loadCatTasks();
+      // Re-checked on every focus (not just app mount) so a day rollover
+      // while the app stayed backgrounded, or a network blip that skipped
+      // caching, both self-heal next time the screen is seen.
+      getVerseOfTheDay().then(setVerse);
     }, [loadCategories, loadTasks, loadCatTasks])
   );
+
+  // Once per calendar day, clear the date (not the task) off anything left
+  // incomplete from a previous day — the safety net for when "End My Day"
+  // wasn't run to explicitly reschedule/drop unfinished items. The task
+  // stays in its category as a dateless backlog item instead of quietly
+  // sitting on a day view that's already passed.
+  useEffect(() => {
+    if (!userId) return;
+    shouldRunStaleDateSweep().then(async should => {
+      if (!should) return;
+      const today = toISODate(new Date());
+      const { error } = await supabase
+        .from('tasks')
+        .update({ date: null })
+        .eq('user_id', userId)
+        .eq('is_completed', false)
+        .lt('date', today);
+      if (error) { console.error(error); return; }
+      await markStaleDateSweepRun();
+      loadTasks();
+      loadCatTasks();
+    });
+  }, [userId, loadTasks, loadCatTasks]);
 
   const toggle = useCallback(async (id: string) => {
     const target = tasks.find(t => t.id === id) ?? catTasks.find(t => t.id === id);
@@ -891,17 +904,11 @@ export default function HomeScreen() {
     } else {
       setTasks(prev => prev.filter(t => t.id !== id));
     }
-    const today = toISODate(new Date());
-    const catEnd = new Date(); catEnd.setDate(catEnd.getDate() + 30);
-    if (inCatWindow(row.date, today, toISODate(catEnd))) {
-      setCatTasks(prev => sortByDateThenTime(
-        prev.some(t => t.id === id)
-          ? prev.map(t => t.id === id ? rowToTask(row) : t)
-          : [...prev, rowToTask(row)]
-      ));
-    } else {
-      setCatTasks(prev => prev.filter(t => t.id !== id));
-    }
+    setCatTasks(prev => sortByDateThenTime(
+      prev.some(t => t.id === id)
+        ? prev.map(t => t.id === id ? rowToTask(row) : t)
+        : [...prev, rowToTask(row)]
+    ));
   }, [selectedDate]);
 
   const addTask = useCallback(async (nt: NewTask) => {
@@ -949,17 +956,12 @@ export default function HomeScreen() {
     if (row.date === toISODate(selectedDate)) {
       setTasks(prev => sortByTime([...prev, rowToTask(row)]));
     }
-    const today = toISODate(new Date());
-    const catEnd = new Date(); catEnd.setDate(catEnd.getDate() + 30);
-    if (inCatWindow(row.date, today, toISODate(catEnd))) {
-      setCatTasks(prev => sortByDateThenTime([...prev, rowToTask(row)]));
-    }
+    setCatTasks(prev => sortByDateThenTime([...prev, rowToTask(row)]));
   }, [userId, selectedDate]);
 
   const addTasks = useCallback(async (suggested: SuggestedTask[]) => {
     if (!userId) return;
     const today = toISODate(new Date());
-    const catEnd = new Date(); catEnd.setDate(catEnd.getDate() + 30);
     for (const s of suggested) {
       const matchedCat = categories.find(c => c.name.toLowerCase() === s.categoryName?.toLowerCase());
       const scheduledTime = s.scheduledTime ? `${s.scheduledTime}:00` : null;
@@ -981,9 +983,7 @@ export default function HomeScreen() {
       if (row.date === toISODate(selectedDate)) {
         setTasks(prev => sortByTime([...prev, rowToTask(row)]));
       }
-      if (inCatWindow(row.date, today, toISODate(catEnd))) {
-        setCatTasks(prev => sortByDateThenTime([...prev, rowToTask(row)]));
-      }
+      setCatTasks(prev => sortByDateThenTime([...prev, rowToTask(row)]));
     }
   }, [userId, categories, selectedDate]);
 
@@ -1054,7 +1054,7 @@ export default function HomeScreen() {
           tasks={catTasks}
           onToggleTask={toggle}
           onLongPressTask={setActionTask}
-          onAddTask={(categoryId, title) => addTask({ title, categoryId, date: toISODate(selectedDate), startTime: '', duration: '', isRecurring: false })}
+          onAddTask={(categoryId, title) => addTask({ title, categoryId, date: '', startTime: '', duration: '', isRecurring: false })}
           onAddCategory={addCategory}
           onEditCategory={updateCategory}
           onDeleteCategory={removeCategory}

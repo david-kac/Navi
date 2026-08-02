@@ -24,7 +24,7 @@ const MARGIN = 18;
 const HOURS   = ['12','01','02','03','04','05','06','07','08','09','10','11'];
 const MINUTES = ['00','05','10','15','20','25','30','35','40','45','50','55'];
 const PERIODS = ['AM','PM'];
-const ITEM_H  = 44;
+const ITEM_H  = 60;
 const WEEK_DAYS = ['Mo','Tu','We','Th','Fr','Sa','Su'];
 
 type RepeatType = 'daily' | 'weekly' | 'monthly';
@@ -203,8 +203,8 @@ function ScrollCol({ items, selected, onSettle }: ColProps) {
 const col = StyleSheet.create({
   wrap:   { height: ITEM_H * 3, flex: 1 },
   item:   { height: ITEM_H, alignItems: 'center', justifyContent: 'center' },
-  txt:    { fontFamily: 'VT323', fontSize: 28, color: MUTED, lineHeight: 32 },
-  txtSel: { color: INK, fontSize: 32 },
+  txt:    { fontFamily: 'VT323', fontSize: 32, color: MUTED, lineHeight: 36 },
+  txtSel: { color: INK, fontSize: 36 },
 });
 
 // ─── Inline repeat section ────────────────────────────────────────────────────
@@ -967,5 +967,5 @@ const s = StyleSheet.create({
     position: 'absolute', top: ITEM_H, left: 0, right: 0, height: ITEM_H,
     borderTopWidth: BORDER, borderBottomWidth: BORDER, borderColor: INK,
   },
-  colon: { fontFamily: 'VT323', fontSize: 28, color: INK, lineHeight: 32, paddingHorizontal: 4, paddingBottom: 4 },
+  colon: { fontFamily: 'VT323', fontSize: 32, color: INK, lineHeight: 36, paddingHorizontal: 4, paddingBottom: 4 },
 });

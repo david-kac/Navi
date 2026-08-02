@@ -74,7 +74,17 @@ TOOLS — delete_task (removing existing tasks):
 TOOLS — review_schedule (on-demand conflict check):
 - Call this whenever David asks you to check his schedule, review for conflicts, or "does my day look okay" — anytime, not just in the morning session.
 - It returns a fresh, live conflict check (overlaps, commute windows, Thursday date night) — always trust its result over the possibly-stale CONFLICTS DETECTED section above.
-- Summarize the result in plain language. Don't call it unless David asks.`;
+- Summarize the result in plain language. Don't call it unless David asks.
+
+TOOLS — add_category (creating a new category):
+- Use this when David asks to create/add a new category. Same confirmation rule as add_task: if he gives a clear, explicit name ("make a category called Yard Work"), call add_category right away. If he's vague about the name, confirm the exact name back to him in chat and wait for a yes before calling it.
+- New categories get a generic default icon — tell David he can pick a different one later from the CATS tab if he wants.
+- Once created, the category is immediately usable as categoryName in add_task/update_task later in this same conversation.
+
+TOOLS — lookup_past_tasks (checking a previous day or range):
+- UPCOMING SCHEDULE above only covers today through the next 4 weeks. Whenever David asks about a day before today — "what did I do last Tuesday", "did I get to X last week", "what was on my plate that day" — call lookup_past_tasks instead of guessing or saying you don't know.
+- Resolve whatever he said ("last Tuesday", "the 12th") to an actual startDate using today's date above; pass endDate too for a range.
+- Summarize what comes back in plain language once it returns.`;
 }
 
 // ─── Claude API call ──────────────────────────────────────────────────────────
@@ -292,6 +302,40 @@ const REVIEW_SCHEDULE_TOOL = {
   },
 };
 
+const ADD_CATEGORY_TOOL = {
+  name: 'add_category',
+  description: 'Create a new task category. Only call this after the user has confirmed the exact name (an explicit name in the same request counts as confirmation) — never create one they did not ask for.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      name: { type: 'string', description: 'The category name, e.g. "Yard Work".' },
+    },
+    required: ['name'],
+  },
+};
+
+export interface AddCategoryToolInput {
+  name: string;
+}
+
+const LOOKUP_PAST_TASKS_TOOL = {
+  name: 'lookup_past_tasks',
+  description: "Look up the user's tasks from a past date or date range (before today). Call this whenever the user asks about a previous day/week instead of guessing — UPCOMING SCHEDULE only covers today forward.",
+  input_schema: {
+    type: 'object',
+    properties: {
+      startDate: { type: 'string', description: 'YYYY-MM-DD, inclusive. The earliest date to look up.' },
+      endDate:   { type: 'string', description: 'YYYY-MM-DD, inclusive. Omit or match startDate for a single day.' },
+    },
+    required: ['startDate'],
+  },
+};
+
+export interface LookupPastTasksToolInput {
+  startDate: string;
+  endDate?: string;
+}
+
 async function callClaudeRaw(
   systemPrompt: string,
   messages: AnthropicMessage[],
@@ -312,7 +356,7 @@ async function callClaudeRaw(
       max_tokens: maxTokens,
       system:     systemPrompt,
       messages,
-      tools:      [ADD_TASK_TOOL, UPDATE_TASK_TOOL, DELETE_TASK_TOOL, REVIEW_SCHEDULE_TOOL],
+      tools:      [ADD_TASK_TOOL, UPDATE_TASK_TOOL, DELETE_TASK_TOOL, REVIEW_SCHEDULE_TOOL, ADD_CATEGORY_TOOL, LOOKUP_PAST_TASKS_TOOL],
     }),
   });
 
@@ -337,6 +381,8 @@ export interface PlannerToolExecutors {
   executeUpdateTask:   (input: UpdateTaskToolInput) => Promise<{ success: boolean; message: string }>;
   executeDeleteTask:   (input: DeleteTaskToolInput) => Promise<{ success: boolean; message: string }>;
   executeReviewSchedule: () => Promise<{ success: boolean; message: string }>;
+  executeAddCategory:  (input: AddCategoryToolInput) => Promise<{ success: boolean; message: string }>;
+  executeLookupPastTasks: (input: LookupPastTasksToolInput) => Promise<{ success: boolean; message: string }>;
 }
 
 export async function runPlannerTurn(
@@ -385,6 +431,14 @@ export async function runPlannerTurn(
         toolResults.push({ type: 'tool_result', tool_use_id: call.id, content: result.message });
       } else if (call.name === 'review_schedule') {
         const result = await executors.executeReviewSchedule();
+        toolResults.push({ type: 'tool_result', tool_use_id: call.id, content: result.message });
+      } else if (call.name === 'add_category') {
+        const input = call.input as unknown as AddCategoryToolInput;
+        const result = await executors.executeAddCategory(input);
+        toolResults.push({ type: 'tool_result', tool_use_id: call.id, content: result.message });
+      } else if (call.name === 'lookup_past_tasks') {
+        const input = call.input as unknown as LookupPastTasksToolInput;
+        const result = await executors.executeLookupPastTasks(input);
         toolResults.push({ type: 'tool_result', tool_use_id: call.id, content: result.message });
       } else {
         toolResults.push({ type: 'tool_result', tool_use_id: call.id, content: `Unknown tool: ${call.name}` });
