@@ -14,7 +14,7 @@ import { analyzeAssetAndSuggestTasks, SuggestedTask, AssetMimeType } from '../li
 import TaskPreviewModal from '../components/TaskPreviewModal';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../lib/AuthProvider';
-import { buildDotSystemPrompt, runPlannerTurn, AnthropicMessage, AddTaskToolInput, UpdateTaskToolInput, DeleteTaskToolInput, AddCategoryToolInput, LookupPastTasksToolInput } from '../lib/ai';
+import { buildDotSystemPrompt, runPlannerTurn, AnthropicMessage, AddTaskToolInput, UpdateTaskToolInput, DeleteTaskToolInput, AddCategoryToolInput, GetTasksByDateRangeToolInput, GetTasksByCategoryToolInput } from '../lib/ai';
 import { detectConflicts, Conflict, TaskSlot } from '../lib/conflicts';
 import { generateTasksForDate } from '../lib/recurring';
 import { shouldShowMorningFlow, markMorningFlowShown } from '../lib/morningGate';
@@ -362,12 +362,28 @@ export default function DotChat() {
     return { success: true, message: 'Category created successfully.' };
   }, [userId]);
 
-  const executeLookupPastTasks = useCallback(async (input: LookupPastTasksToolInput): Promise<{ success: boolean; message: string }> => {
+  const executeGetTasksByDateRange = useCallback(async (input: GetTasksByDateRangeToolInput): Promise<{ success: boolean; message: string }> => {
     if (!userId) return { success: false, message: 'Not signed in.' };
     if (!/^\d{4}-\d{2}-\d{2}$/.test(input.startDate)) {
       return { success: false, message: 'Invalid startDate — must be YYYY-MM-DD.' };
     }
     const endDate = input.endDate && /^\d{4}-\d{2}-\d{2}$/.test(input.endDate) ? input.endDate : input.startDate;
+
+    // Unlike a purely-past lookup, this range can extend into the future
+    // beyond what fetchUpcomingTasks already materialized — recurring tasks
+    // there won't exist as rows yet, so generate them first or they'd
+    // silently look like nothing's scheduled.
+    const today = toISODate(new Date());
+    const genStart = input.startDate > today ? input.startDate : today;
+    if (genStart <= endDate) {
+      const MAX_GENERATE_DAYS = 90;
+      const start = new Date(`${genStart}T00:00:00`);
+      const requestedDays = Math.round((new Date(`${endDate}T00:00:00`).getTime() - start.getTime()) / 86400000) + 1;
+      const days = Math.min(requestedDays, MAX_GENERATE_DAYS);
+      for (let i = 0; i < days; i++) {
+        await generateTasksForDate(userId, toISODate(addDays(start, i)));
+      }
+    }
 
     const { data, error } = await supabase
       .from('tasks')
@@ -379,7 +395,7 @@ export default function DotChat() {
       .order('scheduled_time', { ascending: true });
     if (error) {
       console.error(error);
-      return { success: false, message: `Failed to look up past tasks: ${error.message}` };
+      return { success: false, message: `Failed to look up tasks: ${error.message}` };
     }
 
     const rows = (data ?? []) as TaskRow[];
@@ -389,6 +405,60 @@ export default function DotChat() {
       const when = r.scheduled_time ? fmt12(r.scheduled_time) : 'unscheduled';
       const status = r.is_ttfo ? 'undecided' : r.is_completed ? 'done' : 'not done';
       return `- ${r.date} — ${r.title} — ${when} (${status})`;
+    }).join('\n');
+    return { success: true, message: lines };
+  }, [userId]);
+
+  const executeGetUnscheduledTasks = useCallback(async (): Promise<{ success: boolean; message: string }> => {
+    if (!userId) return { success: false, message: 'Not signed in.' };
+    const { data, error } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('user_id', userId)
+      .is('date', null)
+      .eq('is_completed', false)
+      .order('title', { ascending: true });
+    if (error) {
+      console.error(error);
+      return { success: false, message: `Failed to look up unscheduled tasks: ${error.message}` };
+    }
+
+    const rows = (data ?? []) as TaskRow[];
+    if (!rows.length) return { success: true, message: 'No unscheduled backlog tasks.' };
+
+    const lines = rows.map(r => {
+      const catName = categoriesRef.current.find(c => c.id === r.category_id)?.name ?? 'Open';
+      const when = r.scheduled_time ? ` — ${fmt12(r.scheduled_time)}` : '';
+      return `- [${catName}] ${r.title}${when}`;
+    }).join('\n');
+    return { success: true, message: lines };
+  }, [userId]);
+
+  const executeGetTasksByCategory = useCallback(async (input: GetTasksByCategoryToolInput): Promise<{ success: boolean; message: string }> => {
+    if (!userId) return { success: false, message: 'Not signed in.' };
+    const name = input.categoryName.trim();
+    const isOpen = name.toLowerCase() === 'open';
+    const cat = isOpen ? null : categoriesRef.current.find(c => c.name.toLowerCase() === name.toLowerCase());
+    if (!isOpen && !cat) {
+      return { success: false, message: `No category named "${name}" — check the available categories and try again.` };
+    }
+
+    let query = supabase.from('tasks').select('*').eq('user_id', userId).eq('is_completed', false);
+    query = cat ? query.eq('category_id', cat.id) : query.is('category_id', null);
+    const { data, error } = await query
+      .order('date', { ascending: true, nullsFirst: false })
+      .order('scheduled_time', { ascending: true });
+    if (error) {
+      console.error(error);
+      return { success: false, message: `Failed to look up category tasks: ${error.message}` };
+    }
+
+    const rows = (data ?? []) as TaskRow[];
+    if (!rows.length) return { success: true, message: `No incomplete tasks in "${name}".` };
+
+    const lines = rows.map(r => {
+      const when = `${r.date ?? 'no date'}${r.scheduled_time ? ` ${fmt12(r.scheduled_time)}` : ''}`;
+      return `- ${r.title} — ${when}`;
     }).join('\n');
     return { success: true, message: lines };
   }, [userId]);
@@ -546,7 +616,7 @@ export default function DotChat() {
 
     setSending(true);
     try {
-      const result = await runPlannerTurn(system, [], kickoff, { executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule, executeAddCategory, executeLookupPastTasks });
+      const result = await runPlannerTurn(system, [], kickoff, { executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule, executeAddCategory, executeGetTasksByDateRange, executeGetUnscheduledTasks, executeGetTasksByCategory });
       historyRef.current = result.history;
       setDisplay(prev => [...prev, { id: 'greet', kind: 'dot', text: result.replyText }]);
       setStage('chatting');
@@ -556,7 +626,7 @@ export default function DotChat() {
     } finally {
       setSending(false);
     }
-  }, [userId, modeParam, executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule, executeAddCategory, executeLookupPastTasks]);
+  }, [userId, modeParam, executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule, executeAddCategory, executeGetTasksByDateRange, executeGetUnscheduledTasks, executeGetTasksByCategory]);
 
   useEffect(() => { greet(); }, [userId, modeParam]);
 
@@ -581,7 +651,7 @@ export default function DotChat() {
     setInput('');
     setSending(true);
     try {
-      const result = await runPlannerTurn(systemPromptRef.current, historyRef.current, text, { executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule, executeAddCategory, executeLookupPastTasks });
+      const result = await runPlannerTurn(systemPromptRef.current, historyRef.current, text, { executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule, executeAddCategory, executeGetTasksByDateRange, executeGetUnscheduledTasks, executeGetTasksByCategory });
       historyRef.current = result.history;
       setDisplay(prev => [...prev, { id: `a-${Date.now()}`, kind: 'dot', text: result.replyText }]);
     } catch (e) {

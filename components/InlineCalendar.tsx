@@ -11,12 +11,12 @@ const RADIUS = 4;
 const MARGIN = 18;
 
 const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
-const DAY_HDRS    = ['Mo','Tu','We','Th','Fr','Sa','Su'];
+const DAY_HDRS    = ['Su','Mo','Tu','We','Th','Fr','Sa'];
 
 function monthGrid(year: number, month: number): (number | null)[][] {
   const firstDow   = new Date(year, month, 1).getDay(); // 0=Sun
   const daysInMon  = new Date(year, month + 1, 0).getDate();
-  const startOff   = firstDow === 0 ? 6 : firstDow - 1; // Mon-first
+  const startOff   = firstDow; // Sun-first
   const cells: (number | null)[] = [
     ...Array(startOff).fill(null),
     ...Array.from({ length: daysInMon }, (_, i) => i + 1),

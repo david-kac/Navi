@@ -696,18 +696,20 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
                   <Text style={s.backTxt}>← BACK</Text>
                 </TouchableOpacity>
               </View>
-              {options.map(cat => (
-                <TouchableOpacity
-                  key={cat.id}
-                  style={[s.catOption, cat.id === categoryId && s.catOptionActive]}
-                  onPress={() => { setCategoryId(cat.id); setPanel('main'); }}
-                  activeOpacity={0.8}
-                >
-                  <Text style={[s.catOptionTxt, cat.id === categoryId && s.catOptionTxtActive]}>
-                    {cat.name.toUpperCase()}
-                  </Text>
-                </TouchableOpacity>
-              ))}
+              <ScrollView style={s.catList} showsVerticalScrollIndicator={false}>
+                {options.map(cat => (
+                  <TouchableOpacity
+                    key={cat.id}
+                    style={[s.catOption, cat.id === categoryId && s.catOptionActive]}
+                    onPress={() => { setCategoryId(cat.id); setPanel('main'); }}
+                    activeOpacity={0.8}
+                  >
+                    <Text style={[s.catOptionTxt, cat.id === categoryId && s.catOptionTxtActive]}>
+                      {cat.name.toUpperCase()}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
             </>
           )}
 
@@ -947,7 +949,8 @@ const s = StyleSheet.create({
   panelHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   backTxt:     { fontFamily: 'PressStart2P', fontSize: 6, color: MUTED, lineHeight: 9 },
 
-  catOption:        { borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, paddingHorizontal: 14, paddingVertical: 13 },
+  catList:          { maxHeight: 360 },
+  catOption:        { borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, paddingHorizontal: 14, paddingVertical: 13, marginBottom: 14 },
   catOptionActive:  { backgroundColor: INK },
   catOptionTxt:     { fontFamily: 'VT323', fontSize: 18, color: INK, lineHeight: 20 },
   catOptionTxtActive: { color: BG },

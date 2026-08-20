@@ -81,10 +81,20 @@ TOOLS — add_category (creating a new category):
 - New categories get a generic default icon — tell David he can pick a different one later from the CATS tab if he wants.
 - Once created, the category is immediately usable as categoryName in add_task/update_task later in this same conversation.
 
-TOOLS — lookup_past_tasks (checking a previous day or range):
-- UPCOMING SCHEDULE above only covers today through the next 4 weeks. Whenever David asks about a day before today — "what did I do last Tuesday", "did I get to X last week", "what was on my plate that day" — call lookup_past_tasks instead of guessing or saying you don't know.
+TOOLS — get_tasks_by_date_range (checking a specific day or range, past or future):
+- UPCOMING SCHEDULE above only covers today through the next 4 weeks. Whenever David asks about a specific day or range outside that window — before today ("what did I do last Tuesday", "did I get to X last week"), or further out than 4 weeks ("what's on my plate in October") — call get_tasks_by_date_range instead of guessing or saying you don't know.
 - Resolve whatever he said ("last Tuesday", "the 12th") to an actual startDate using today's date above; pass endDate too for a range.
-- Summarize what comes back in plain language once it returns.`;
+- Summarize what comes back in plain language once it returns.
+
+TOOLS — get_unscheduled_tasks (dateless backlog items):
+- UPCOMING SCHEDULE above only includes tasks that have a date. Tasks with no date at all (David explicitly cleared the date, or a stale-date sweep removed it) live in the backlog and are invisible above. Whenever David asks about backlog items, "stuff with no date", or open/unscheduled tasks not on his calendar, call get_unscheduled_tasks instead of assuming he has none.
+- Summarize what comes back in plain language.
+
+TOOLS — get_tasks_by_category (everything in one category, all-time):
+- UPCOMING SCHEDULE above only covers dated tasks in the next 4 weeks, so a category can have older or dateless tasks that don't show there. Whenever David asks about a specific category's tasks or workload — "what's on my Freelance list", "how much backyard stuff do I have" — call get_tasks_by_category instead of relying only on what's above.
+- categoryName must exactly match one of the available categories above, or "Open" for uncategorized tasks.
+- Only returns incomplete tasks (David's typical intent when asking what's "on" a category) — completed history for a category isn't covered by this tool.
+- Summarize what comes back in plain language.`;
 }
 
 // ─── Claude API call ──────────────────────────────────────────────────────────
@@ -318,9 +328,9 @@ export interface AddCategoryToolInput {
   name: string;
 }
 
-const LOOKUP_PAST_TASKS_TOOL = {
-  name: 'lookup_past_tasks',
-  description: "Look up the user's tasks from a past date or date range (before today). Call this whenever the user asks about a previous day/week instead of guessing — UPCOMING SCHEDULE only covers today forward.",
+const GET_TASKS_BY_DATE_RANGE_TOOL = {
+  name: 'get_tasks_by_date_range',
+  description: "Look up the user's tasks for a specific date or date range, past or future. Call this whenever the user asks about a day/week outside UPCOMING SCHEDULE's 4-week window instead of guessing.",
   input_schema: {
     type: 'object',
     properties: {
@@ -331,9 +341,34 @@ const LOOKUP_PAST_TASKS_TOOL = {
   },
 };
 
-export interface LookupPastTasksToolInput {
+export interface GetTasksByDateRangeToolInput {
   startDate: string;
   endDate?: string;
+}
+
+const GET_UNSCHEDULED_TASKS_TOOL = {
+  name: 'get_unscheduled_tasks',
+  description: "Look up the user's dateless backlog tasks — items with no date at all, which are NOT included in UPCOMING SCHEDULE (that only covers dated tasks). Call this whenever the user asks about backlog items or unscheduled tasks not on the calendar.",
+  input_schema: {
+    type: 'object',
+    properties: {},
+  },
+};
+
+const GET_TASKS_BY_CATEGORY_TOOL = {
+  name: 'get_tasks_by_category',
+  description: "Look up every incomplete task in one category, regardless of date — including tasks outside UPCOMING SCHEDULE's 4-week window. Call this whenever the user asks about a specific category's tasks or workload.",
+  input_schema: {
+    type: 'object',
+    properties: {
+      categoryName: { type: 'string', description: 'Must exactly match one of the available categories, or "Open" for uncategorized tasks.' },
+    },
+    required: ['categoryName'],
+  },
+};
+
+export interface GetTasksByCategoryToolInput {
+  categoryName: string;
 }
 
 async function callClaudeRaw(
@@ -356,7 +391,7 @@ async function callClaudeRaw(
       max_tokens: maxTokens,
       system:     systemPrompt,
       messages,
-      tools:      [ADD_TASK_TOOL, UPDATE_TASK_TOOL, DELETE_TASK_TOOL, REVIEW_SCHEDULE_TOOL, ADD_CATEGORY_TOOL, LOOKUP_PAST_TASKS_TOOL],
+      tools:      [ADD_TASK_TOOL, UPDATE_TASK_TOOL, DELETE_TASK_TOOL, REVIEW_SCHEDULE_TOOL, ADD_CATEGORY_TOOL, GET_TASKS_BY_DATE_RANGE_TOOL, GET_UNSCHEDULED_TASKS_TOOL, GET_TASKS_BY_CATEGORY_TOOL],
     }),
   });
 
@@ -382,7 +417,9 @@ export interface PlannerToolExecutors {
   executeDeleteTask:   (input: DeleteTaskToolInput) => Promise<{ success: boolean; message: string }>;
   executeReviewSchedule: () => Promise<{ success: boolean; message: string }>;
   executeAddCategory:  (input: AddCategoryToolInput) => Promise<{ success: boolean; message: string }>;
-  executeLookupPastTasks: (input: LookupPastTasksToolInput) => Promise<{ success: boolean; message: string }>;
+  executeGetTasksByDateRange: (input: GetTasksByDateRangeToolInput) => Promise<{ success: boolean; message: string }>;
+  executeGetUnscheduledTasks: () => Promise<{ success: boolean; message: string }>;
+  executeGetTasksByCategory: (input: GetTasksByCategoryToolInput) => Promise<{ success: boolean; message: string }>;
 }
 
 export async function runPlannerTurn(
@@ -436,9 +473,16 @@ export async function runPlannerTurn(
         const input = call.input as unknown as AddCategoryToolInput;
         const result = await executors.executeAddCategory(input);
         toolResults.push({ type: 'tool_result', tool_use_id: call.id, content: result.message });
-      } else if (call.name === 'lookup_past_tasks') {
-        const input = call.input as unknown as LookupPastTasksToolInput;
-        const result = await executors.executeLookupPastTasks(input);
+      } else if (call.name === 'get_tasks_by_date_range') {
+        const input = call.input as unknown as GetTasksByDateRangeToolInput;
+        const result = await executors.executeGetTasksByDateRange(input);
+        toolResults.push({ type: 'tool_result', tool_use_id: call.id, content: result.message });
+      } else if (call.name === 'get_unscheduled_tasks') {
+        const result = await executors.executeGetUnscheduledTasks();
+        toolResults.push({ type: 'tool_result', tool_use_id: call.id, content: result.message });
+      } else if (call.name === 'get_tasks_by_category') {
+        const input = call.input as unknown as GetTasksByCategoryToolInput;
+        const result = await executors.executeGetTasksByCategory(input);
         toolResults.push({ type: 'tool_result', tool_use_id: call.id, content: result.message });
       } else {
         toolResults.push({ type: 'tool_result', tool_use_id: call.id, content: `Unknown tool: ${call.name}` });
