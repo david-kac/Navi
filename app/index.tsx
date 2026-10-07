@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity,
-  StyleSheet, Image, TextInput, Alert,
+  StyleSheet, Image, TextInput, Alert, AppState,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter, useFocusEffect } from 'expo-router';
 import DotCharacter, { DotMood } from '../components/DotCharacter';
@@ -13,23 +14,27 @@ import type { SuggestedTask } from '../lib/ai';
 import TaskActionSheet from '../components/TaskActionSheet';
 import CategoryActionSheet from '../components/CategoryActionSheet';
 import InlineCalendar from '../components/InlineCalendar';
+import TaskDetailModal from '../components/TaskDetailModal';
+import TimerPickerModal, { TimerPickOption } from '../components/TimerPickerModal';
+import { pickFreeSprite } from '../components/FreeSprites';
+import { TimerState, loadTimer, saveTimer, newTimer, stopTimer, resumeTimer, elapsedMs, isRunning } from '../lib/timer';
+import { RuleRow, cadenceLabel, nextOccurrence } from '../lib/cadence';
 import { DEFAULT_CATEGORIES, OPEN_CATEGORY, OPEN_CATEGORY_ID } from '../constants/categories';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../lib/AuthProvider';
 import type { Database } from '../lib/database.types';
 import { getTimePeriod } from '../lib/database.types';
 import { generateTasksForDate, deleteRecurringOccurrence, deleteRecurringSeries } from '../lib/recurring';
-import { shouldShowMorningFlow } from '../lib/morningGate';
 import { shouldRunDailyCleanup, markDailyCleanupRun, shouldRunStaleDateSweep, markStaleDateSweepRun } from '../lib/taskCleanup';
 import { getVerseOfTheDay, Verse } from '../lib/verseOfTheDay';
 
 type TaskRow = Database['public']['Tables']['tasks']['Row'];
 type CategoryRow = Database['public']['Tables']['categories']['Row'];
 import {
-  BookOpen, Briefcase, Calendar, ChevronDown, ChevronLeft,
+  Book, BookOpen, Briefcase, Calendar, ChevronDown, ChevronLeft,
   ChevronRight, ChevronUp, Circle, ClipboardList, Dumbbell,
   Heart, Home as HomeIcon, Layers, Pencil, Plus,
-  RefreshCw, Repeat, Sparkles, Star, Sun, X, Zap,
+  RefreshCw, Repeat, Sparkles, Star, Sun, Timer, X, Zap,
 } from 'lucide-react-native';
 
 // ─── Design tokens ─────────────────────────────────────────────────────────────
@@ -61,6 +66,7 @@ interface Task {
   isCompleted:    boolean;
   timePeriod:     TimePeriod;
   isTTFO:         boolean;
+  details?:       string;
 }
 
 // ─── DB row to UI model ─────────────────────────────────────────────────────
@@ -77,6 +83,7 @@ function rowToTask(row: TaskRow): Task {
     isCompleted:     row.is_completed,
     timePeriod:      getTimePeriod(row.scheduled_time),
     isTTFO:          row.is_ttfo,
+    details:         row.notes ?? undefined,
   };
 }
 
@@ -115,6 +122,39 @@ function to24Hour(label: string): string | null {
   if (match[3] === 'PM' && h !== 12) h += 12;
   if (match[3] === 'AM' && h === 12) h = 0;
   return `${h.toString().padStart(2, '0')}:${match[2]}:00`;
+}
+
+// ─── Free time ─────────────────────────────────────────────────────────────────
+const FREE_MIN_GAP = 15;      // smallest gap (min) worth showing as a FREE TIME block
+const DEFAULT_TASK_MINS = 30; // timed tasks with no duration are assumed this long (same as AddTaskModal's open slots)
+
+interface FreeBlock { startMin: number; endMin: number }
+
+const toMinutes = (t: string) => { const [h, m] = t.split(':').map(Number); return h * 60 + m; };
+
+// For each gap between consecutive timed tasks, returns the block keyed by the
+// id of the task that precedes it (blocks render right after that task).
+function computeFreeBlocks(dayTasks: Task[]): Map<string, FreeBlock> {
+  const timed = dayTasks
+    .filter(t => t.scheduledTime && !t.isTTFO)
+    .map(t => ({ id: t.id, start: toMinutes(t.scheduledTime!), dur: t.durationMins ?? DEFAULT_TASK_MINS }))
+    .sort((a, b) => a.start - b.start);
+  const out = new Map<string, FreeBlock>();
+  let ownerId: string | null = null;
+  let maxEnd = -1;
+  for (const t of timed) {
+    if (ownerId && t.start - maxEnd >= FREE_MIN_GAP) out.set(ownerId, { startMin: maxEnd, endMin: t.start });
+    if (t.start + t.dur > maxEnd) { maxEnd = t.start + t.dur; ownerId = t.id; }
+  }
+  return out;
+}
+
+const minLabel = (m: number) => fmt12(`${Math.floor(m / 60) % 24}:${(m % 60).toString().padStart(2, '0')}`);
+
+// Sunday-start week containing `d`, as YYYY-MM-DD strings.
+function weekDatesSunday(d: Date): string[] {
+  const start = new Date(d.getFullYear(), d.getMonth(), d.getDate() - d.getDay());
+  return Array.from({ length: 7 }, (_, i) => toISODate(new Date(start.getFullYear(), start.getMonth(), start.getDate() + i)));
 }
 
 // ─── Icon grid for new category ─────────────────────────────────────────────────
@@ -190,9 +230,10 @@ const SWORD_ACTIVE    = require('../assets/Battle active.png');
 const SWORD_INACTIVE  = require('../assets/Battle inactive.png');
 
 // ─── Dot + action buttons ──────────────────────────────────────────────────────
-function DotHeader({ mood, onAdd, onOpenChat, onLongPressDot, activeView, onToggleParty, onToggleBattle }: {
+function DotHeader({ mood, onAdd, onOpenChat, onLongPressDot, activeView, onToggleParty, onToggleBattle, timerActive, timerRunning, onPressTimer }: {
   mood: DotMood; onAdd: () => void; onOpenChat: () => void; onLongPressDot: () => void;
   activeView: ActiveView; onToggleParty: () => void; onToggleBattle: () => void;
+  timerActive: boolean; timerRunning: boolean; onPressTimer: () => void;
 }) {
   return (
     <View style={s.dotHeader}>
@@ -200,6 +241,10 @@ function DotHeader({ mood, onAdd, onOpenChat, onLongPressDot, activeView, onTogg
         <DotCharacter mood={mood} />
       </TouchableOpacity>
       <View style={s.dotBtns}>
+        <TouchableOpacity style={[s.timerBtn, timerActive && s.timerBtnOn]} onPress={onPressTimer} activeOpacity={0.7}>
+          <Timer size={16} color={timerActive ? BG : INK} strokeWidth={1.5} />
+          {timerRunning && <Text style={s.timerDot}>●</Text>}
+        </TouchableOpacity>
         <TouchableOpacity style={s.bannerBtn} onPress={onToggleBattle} activeOpacity={0.7}>
           <Image source={activeView === 'battle' ? SWORD_ACTIVE : SWORD_INACTIVE} style={[s.bannerIcon, { marginLeft: 4 }]} resizeMode="contain" />
         </TouchableOpacity>
@@ -288,11 +333,12 @@ function SectionHeader({ title }: { title: string }) {
 }
 
 // ─── Task card ─────────────────────────────────────────────────────────────────
-function TaskCard({ task, icon, onToggle, onLongPress }: { task: Task; icon: string; onToggle: (id: string) => void; onLongPress: (task: Task) => void }) {
+function TaskCard({ task, icon, onToggle, onLongPress, onOpen }: { task: Task; icon: string; onToggle: (id: string) => void; onLongPress: (task: Task) => void; onOpen: (task: Task) => void }) {
   const sub = timeLabel(task.scheduledTime, task.durationMins);
   return (
     <TouchableOpacity
       style={[s.card, task.isCompleted && s.cardFaded]}
+      onPress={() => onOpen(task)}
       onLongPress={() => onLongPress(task)}
       delayLongPress={400}
       activeOpacity={0.85}
@@ -304,7 +350,10 @@ function TaskCard({ task, icon, onToggle, onLongPress }: { task: Task; icon: str
         </View>
       </TouchableOpacity>
       <View style={s.cardContent}>
-        <Text style={[s.cardTitle, task.isCompleted && s.cardTitleDone]} numberOfLines={1}>{task.title}</Text>
+        <View style={s.titleRow}>
+          <Text style={[s.cardTitle, s.titleFlex, task.isCompleted && s.cardTitleDone]} numberOfLines={1}>{task.title}</Text>
+          {task.details ? <Book size={12} color={MUTED} strokeWidth={1.5} /> : null}
+        </View>
         {sub ? <Text style={s.cardSub}>{sub}</Text> : null}
       </View>
       {task.isRecurring && <Repeat size={12} color={MUTED} strokeWidth={1.5} />}
@@ -313,18 +362,36 @@ function TaskCard({ task, icon, onToggle, onLongPress }: { task: Task; icon: str
 }
 
 // ─── Period group ──────────────────────────────────────────────────────────────
-function PeriodGroup({ period, tasks, categoryIconMap, onToggle, onLongPress }: { period: TimePeriod; tasks: Task[]; categoryIconMap: Record<string, string>; onToggle: (id:string)=>void; onLongPress: (task: Task)=>void }) {
+function FreeBlockCard({ block }: { block: FreeBlock }) {
+  const sprite = pickFreeSprite(block.startMin);
+  return (
+    <View style={s.freeCard}>
+      <View style={s.freeIcon}>{sprite.render()}</View>
+      <View style={{ flex: 1 }}>
+        <Text style={s.freeTitle}>FREE TIME</Text>
+        <Text style={s.cardSub}>{minLabel(block.startMin)} - {minLabel(block.endMin)} · {block.endMin - block.startMin}m</Text>
+      </View>
+    </View>
+  );
+}
+
+function PeriodGroup({ period, tasks, categoryIconMap, onToggle, onLongPress, onOpen, freeBlocks }: { period: TimePeriod; tasks: Task[]; categoryIconMap: Record<string, string>; onToggle: (id:string)=>void; onLongPress: (task: Task)=>void; onOpen: (task: Task)=>void; freeBlocks?: Map<string, FreeBlock> }) {
   if (!tasks.length) return null;
   return (
     <View style={s.periodGroup}>
       <SectionHeader title={period.toUpperCase()} />
-      {tasks.map(t => <TaskCard key={t.id} task={t} icon={categoryIconMap[t.categoryId ?? ''] ?? 'ClipboardList'} onToggle={onToggle} onLongPress={onLongPress} />)}
+      {tasks.map(t => (
+        <React.Fragment key={t.id}>
+          <TaskCard task={t} icon={categoryIconMap[t.categoryId ?? ''] ?? 'ClipboardList'} onToggle={onToggle} onLongPress={onLongPress} onOpen={onOpen} />
+          {freeBlocks?.has(t.id) ? <FreeBlockCard block={freeBlocks.get(t.id)!} /> : null}
+        </React.Fragment>
+      ))}
     </View>
   );
 }
 
 // ─── TTFO ─────────────────────────────────────────────────────────────────────
-function TTFOSection({ tasks, categoryIconMap, onToggle, onLongPress }: { tasks: Task[]; categoryIconMap: Record<string, string>; onToggle: (id:string)=>void; onLongPress: (task: Task)=>void }) {
+function TTFOSection({ tasks, categoryIconMap, onToggle, onLongPress, onOpen }: { tasks: Task[]; categoryIconMap: Record<string, string>; onToggle: (id:string)=>void; onLongPress: (task: Task)=>void; onOpen: (task: Task)=>void }) {
   const [open, setOpen] = useState(false);
   if (!tasks.length) return null;
   return (
@@ -337,7 +404,7 @@ function TTFOSection({ tasks, categoryIconMap, onToggle, onLongPress }: { tasks:
         <View style={{ flex: 1 }} />
         <Text style={s.ttfoCount}>{tasks.length}</Text>
       </TouchableOpacity>
-      {open && tasks.map(t => <TaskCard key={t.id} task={t} icon={categoryIconMap[t.categoryId ?? ''] ?? 'ClipboardList'} onToggle={onToggle} onLongPress={onLongPress} />)}
+      {open && tasks.map(t => <TaskCard key={t.id} task={t} icon={categoryIconMap[t.categoryId ?? ''] ?? 'ClipboardList'} onToggle={onToggle} onLongPress={onLongPress} onOpen={onOpen} />)}
     </View>
   );
 }
@@ -381,10 +448,48 @@ interface CatsViewProps {
   onEditCategory: (id: string, name: string, icon: string) => void;
   onDeleteCategory: (id: string) => void;
   onDeleteCompleted: () => void;
+  rules: Record<string, RuleRow>;
+  onOpenTask: (task: Task) => void;
+}
+
+// One row per recurring series instead of one per generated instance. The row
+// is represented by the series' next incomplete occurrence (falling back to the
+// latest instance when everything is done), so toggle/edit/delete act on a real task.
+interface CatEntry { task: Task; rule?: RuleRow; next?: string }
+
+function collapseSeries(list: Task[], rules: Record<string, RuleRow>, todayISO: string): CatEntry[] {
+  const entries: CatEntry[] = [];
+  const bySeries = new Map<string, Task[]>();
+  for (const t of list) {
+    const rule = t.recurringRuleId ? rules[t.recurringRuleId] : undefined;
+    if (!t.recurringRuleId || !rule) { entries.push({ task: t }); continue; }
+    bySeries.set(t.recurringRuleId, [...(bySeries.get(t.recurringRuleId) ?? []), t]);
+  }
+  bySeries.forEach((instances, ruleId) => {
+    const rule = rules[ruleId];
+    const ordered = sortByDateThenTime(instances);
+    const upcoming = ordered.find(t => !t.isCompleted && (!t.date || t.date >= todayISO));
+    const rep = upcoming ?? ordered.find(t => !t.isCompleted) ?? ordered[ordered.length - 1];
+    const doneToday = ordered.some(t => t.date === todayISO && t.isCompleted);
+    entries.push({ task: rep, rule, next: nextOccurrence(rule, todayISO, doneToday ? todayISO : undefined) });
+  });
+  return entries.sort((a, b) => {
+    const ad = a.next ?? a.task.date ?? '9999-99-99';
+    const bd = b.next ?? b.task.date ?? '9999-99-99';
+    return ad !== bd ? ad.localeCompare(bd) : timeSortKey(a.task.scheduledTime).localeCompare(timeSortKey(b.task.scheduledTime));
+  });
+}
+
+function relDateLabel(iso: string): string {
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const d = new Date(iso + 'T00:00:00');
+  return d.getTime() === today.getTime()
+    ? 'Today'
+    : d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
 }
 
 function CatsView({
-  tab, onTabChange, categories, tasks,
+  tab, onTabChange, categories, tasks, rules, onOpenTask,
   onToggleTask, onLongPressTask, onAddTask, onAddCategory, onEditCategory, onDeleteCategory, onDeleteCompleted,
 }: CatsViewProps) {
   const [expanded,    setExpanded]    = useState<Set<string>>(new Set());
@@ -451,7 +556,10 @@ function CatsView({
 
       {categories.map(cat => {
         const isExp    = expanded.has(cat.id);
-        const catTasks = tasks.filter(t => cat.id === OPEN_CATEGORY_ID ? t.categoryId === null : t.categoryId === cat.id);
+        const catTasks = collapseSeries(
+          tasks.filter(t => cat.id === OPEN_CATEGORY_ID ? t.categoryId === null : t.categoryId === cat.id),
+          rules, toISODate(new Date()),
+        );
         return (
           <View key={cat.id} style={s.accordion}>
             {/* Header */}
@@ -474,10 +582,11 @@ function CatsView({
             {/* Body */}
             {isExp && (
               <View style={s.accBody}>
-                {catTasks.map(t => (
+                {catTasks.map(({ task: t, rule, next }) => (
                   <TouchableOpacity
-                    key={t.id}
+                    key={rule ? `series-${rule.id}` : t.id}
                     style={s.accTask}
+                    onPress={() => onOpenTask(t)}
                     onLongPress={() => onLongPressTask(t)}
                     delayLongPress={400}
                     activeOpacity={0.85}
@@ -488,21 +597,16 @@ function CatsView({
                       </View>
                     </TouchableOpacity>
                     <View style={s.accTaskContent}>
-                      <Text style={[s.accTaskName, t.isCompleted && s.cardTitleDone]}>{t.title}</Text>
+                      <View style={s.titleRow}>
+                        <Text style={[s.accTaskName, s.titleFlex, t.isCompleted && s.cardTitleDone]} numberOfLines={1}>{t.title}</Text>
+                        {t.details ? <Book size={11} color={MUTED} strokeWidth={1.5} /> : null}
+                      </View>
                       {(() => {
-                        let dateLabel: string | null = null;
-                        if (t.date) {
-                          const today = new Date(); today.setHours(0,0,0,0);
-                          const taskDate = new Date(t.date + 'T00:00:00');
-                          dateLabel = taskDate.getTime() === today.getTime()
-                            ? 'Today'
-                            : taskDate.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
-                        }
-                        const parts = [
-                          dateLabel ?? 'No date',
-                          timeLabel(t.scheduledTime, t.durationMins),
-                        ].filter(Boolean);
-                        return parts.length ? <Text style={s.accTaskSub}>{parts.join(' · ')}</Text> : null;
+                        const parts = rule
+                          ? [cadenceLabel(rule), `Next: ${relDateLabel(next!)}`, t.durationMins ? `${t.durationMins}m` : null]
+                          : [t.date ? relDateLabel(t.date) : 'No date', timeLabel(t.scheduledTime, t.durationMins)];
+                        const shown = parts.filter(Boolean);
+                        return shown.length ? <Text style={s.accTaskSub}>{shown.join(' · ')}</Text> : null;
                       })()}
                     </View>
                     {t.isRecurring && <Repeat size={11} color={MUTED} strokeWidth={1.5} />}
@@ -670,20 +774,30 @@ export default function HomeScreen() {
   const [actionTask,   setActionTask]  = useState<Task | null>(null);
   const [editingTask,  setEditingTask] = useState<Task | null>(null);
   const [activeView,   setActiveView]  = useState<ActiveView>('home');
+  const [rules,        setRules]       = useState<Record<string, RuleRow>>({});
+  const [showFree,     setShowFree]    = useState(false);
+  const [timer,        setTimer]       = useState<TimerState | null>(null);
+  const [detailTaskId, setDetailTaskId]= useState<string | null>(null);
+  const [showTimerPicker, setShowTimerPicker] = useState(false);
+  const [pickerTasks,  setPickerTasks] = useState<Task[]>([]);
+
+  useEffect(() => {
+    loadTimer().then(setTimer);
+    AsyncStorage.getItem('dot:showFreeTime').then(v => setShowFree(v === '1')).catch(() => {});
+  }, []);
+
+  const updateTimer = useCallback((t: TimerState | null) => { setTimer(t); saveTimer(t); }, []);
+  const toggleFree = useCallback(() => {
+    setShowFree(v => {
+      AsyncStorage.setItem('dot:showFreeTime', v ? '0' : '1').catch(() => {});
+      return !v;
+    });
+  }, []);
 
   useEffect(() => {
     const id = setInterval(() => setTime(nowStr()), 30_000);
     return () => clearInterval(id);
   }, []);
-
-  // First thing each morning (after 5am), jump straight into Dot's morning
-  // greeting/verse/summary flow instead of waiting for a tap.
-  useEffect(() => {
-    if (!userId) return;
-    shouldShowMorningFlow().then(should => {
-      if (should) router.push('/dot-chat');
-    });
-  }, [userId]);
 
   // Load (and lazily seed) this user's categories once.
   const loadCategories = useCallback(async () => {
@@ -761,8 +875,7 @@ export default function HomeScreen() {
     setCatTasks(prev => prev.filter(t => !t.isCompleted));
   }, [userId]);
 
-  // Once per calendar day (checked on app open, same gating pattern as the
-  // morning-flow greeting in lib/morningGate.ts), sweep any tasks left
+  // Once per calendar day (checked on app open, gated via AsyncStorage), sweep any tasks left
   // marked complete from a previous day so they don't pile up indefinitely.
   // Gated so a task checked off today stays visible (with strikethrough)
   // for the rest of today — it's only swept the next time the app opens.
@@ -819,16 +932,44 @@ export default function HomeScreen() {
     setCatTasks((data ?? []).map(rowToTask));
   }, [userId]);
 
+  // Active recurring series, keyed by id — drives cadence text, next occurrence
+  // and time-tracking stats on the Categories tab and in Dot's tools.
+  const loadRules = useCallback(async () => {
+    if (!userId) return;
+    const { data, error } = await supabase.from('recurring_task_rules').select('*').eq('user_id', userId).eq('is_active', true);
+    if (error) { console.error(error); return; }
+    setRules(Object.fromEntries((data ?? []).map(r => [r.id, r])));
+  }, [userId]);
+
+  // One refresh for everything that reads tasks, so Day and Categories can't
+  // drift apart after an add/edit/date change.
+  const refreshAll = useCallback(async () => {
+    await Promise.all([loadTasks(), loadCatTasks(), loadRules()]);
+  }, [loadTasks, loadCatTasks, loadRules]);
+
+  // Coming back from the background doesn't fire a navigation focus event, so
+  // the lists would otherwise stay stale until the app was fully relaunched.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', state => {
+      if (state !== 'active') return;
+      refreshAll();
+      getVerseOfTheDay().then(setVerse);
+      loadTimer().then(setTimer);
+    });
+    return () => sub.remove();
+  }, [refreshAll]);
+
   useFocusEffect(
     useCallback(() => {
       loadCategories();
       loadTasks();
       loadCatTasks();
+      loadRules();
       // Re-checked on every focus (not just app mount) so a day rollover
       // while the app stayed backgrounded, or a network blip that skipped
       // caching, both self-heal next time the screen is seen.
       getVerseOfTheDay().then(setVerse);
-    }, [loadCategories, loadTasks, loadCatTasks])
+    }, [loadCategories, loadTasks, loadCatTasks, loadRules])
   );
 
   // Once per calendar day, clear the date (not the task) off anything left
@@ -854,62 +995,69 @@ export default function HomeScreen() {
     });
   }, [userId, loadTasks, loadCatTasks]);
 
+  const setTaskCompleted = useCallback(async (id: string, completed: boolean) => {
+    setTasks(prev => prev.map(t => t.id === id ? { ...t, isCompleted: completed } : t));
+    setCatTasks(prev => prev.map(t => t.id === id ? { ...t, isCompleted: completed } : t));
+    const { error } = await supabase.from('tasks').update({ is_completed: completed }).eq('id', id);
+    if (error) console.error(error);
+  }, []);
+
   const toggle = useCallback(async (id: string) => {
     const target = tasks.find(t => t.id === id) ?? catTasks.find(t => t.id === id);
     if (!target) return;
-    const nextCompleted = !target.isCompleted;
-    setTasks(prev => prev.map(t => t.id === id ? { ...t, isCompleted: nextCompleted } : t));
-    setCatTasks(prev => prev.map(t => t.id === id ? { ...t, isCompleted: nextCompleted } : t));
-    const { error } = await supabase.from('tasks').update({ is_completed: nextCompleted }).eq('id', id);
-    if (error) console.error(error);
-  }, [tasks, catTasks]);
+    await setTaskCompleted(id, !target.isCompleted);
+  }, [tasks, catTasks, setTaskCompleted]);
 
   const remove = useCallback(async (id: string) => {
+    if (timer?.taskId === id) updateTimer(null);
     setTasks(prev => prev.filter(t => t.id !== id));
     setCatTasks(prev => prev.filter(t => t.id !== id));
     const { error } = await supabase.from('tasks').delete().eq('id', id);
     if (error) console.error(error);
-  }, []);
+  }, [timer, updateTimer]);
 
   const removeOccurrence = useCallback(async (task: Task) => {
     if (!userId || !task.recurringRuleId) return;
+    if (timer?.taskId === task.id) updateTimer(null);
     setTasks(prev => prev.filter(t => t.id !== task.id));
     setCatTasks(prev => prev.filter(t => t.id !== task.id));
     await deleteRecurringOccurrence(userId, task.id, task.recurringRuleId, task.date!);
-  }, [userId]);
+  }, [userId, timer, updateTimer]);
 
   const removeSeries = useCallback(async (task: Task) => {
     if (!task.recurringRuleId) return;
     const ruleId = task.recurringRuleId;
+    if (timer?.ruleId === ruleId) updateTimer(null);
     setTasks(prev => prev.filter(t => t.recurringRuleId !== ruleId));
     setCatTasks(prev => prev.filter(t => t.recurringRuleId !== ruleId));
     await deleteRecurringSeries(ruleId);
-  }, []);
+    setRules(prev => { const next = { ...prev }; delete next[ruleId]; return next; });
+  }, [timer, updateTimer]);
 
   const updateTask = useCallback(async (id: string, nt: NewTask) => {
     const scheduledTime   = nt.startTime ? to24Hour(nt.startTime) : null;
     const durationMinutes = nt.duration ? parseInt(nt.duration, 10) : null;
     const categoryId      = (!nt.categoryId || nt.categoryId === OPEN_CATEGORY_ID) ? null : nt.categoryId;
+    const details         = nt.details?.trim() ? nt.details.trim() : null;
 
     const { data: row, error } = await supabase
       .from('tasks')
-      .update({ title: nt.title, category_id: categoryId, date: nt.date || null, scheduled_time: scheduledTime, duration_minutes: durationMinutes, time_period: getTimePeriod(scheduledTime) })
+      .update({ title: nt.title, category_id: categoryId, date: nt.date || null, scheduled_time: scheduledTime, duration_minutes: durationMinutes, time_period: getTimePeriod(scheduledTime), notes: details })
       .eq('id', id)
       .select('*')
       .single();
     if (error || !row) { console.error(error); return; }
 
-    if (row.date === toISODate(selectedDate)) {
-      setTasks(prev => sortByTime(prev.map(t => t.id === id ? rowToTask(row) : t)));
-    } else {
-      setTasks(prev => prev.filter(t => t.id !== id));
+    // Details on a recurring task also live on its series so future instances inherit them.
+    if (row.recurring_rule_id) {
+      const { error: ruleError } = await supabase.from('recurring_task_rules').update({ notes: details }).eq('id', row.recurring_rule_id);
+      if (ruleError) console.error(ruleError);
     }
-    setCatTasks(prev => sortByDateThenTime(
-      prev.some(t => t.id === id)
-        ? prev.map(t => t.id === id ? rowToTask(row) : t)
-        : [...prev, rowToTask(row)]
-    ));
-  }, [selectedDate]);
+
+    // Single source of truth: re-read from the DB rather than patching local
+    // arrays (patching missed tasks that newly entered the selected day).
+    await refreshAll();
+  }, [refreshAll]);
 
   const addTask = useCallback(async (nt: NewTask) => {
     if (!userId) return;
@@ -917,19 +1065,25 @@ export default function HomeScreen() {
     const durationMinutes  = nt.duration ? parseInt(nt.duration, 10) : null;
     const categoryId       = (!nt.categoryId || nt.categoryId === OPEN_CATEGORY_ID) ? null : nt.categoryId;
     const date              = nt.date || null;
+    const details           = nt.details?.trim() ? nt.details.trim() : null;
 
     let recurringRuleId: string | null = null;
     if (nt.isRecurring) {
+      const ruleType = nt.ruleType ?? 'daily';
       const { data: rule, error: ruleError } = await supabase
         .from('recurring_task_rules')
         .insert({
           user_id:          userId,
           title:            nt.title,
           category_id:      categoryId,
-          rule_type:        'daily',
+          rule_type:        ruleType,
+          days_of_week:     ruleType === 'weekly' ? (nt.daysOfWeek ?? null) : null,
           scheduled_time:   scheduledTime,
           duration_minutes: durationMinutes,
           time_period:      getTimePeriod(scheduledTime),
+          // Only sent when set, so creating recurring tasks keeps working even
+          // before the details migration (rules.notes) has been applied.
+          ...(details ? { notes: details } : {}),
         })
         .select('id')
         .single();
@@ -937,7 +1091,7 @@ export default function HomeScreen() {
       recurringRuleId = rule.id;
     }
 
-    const { data: row, error } = await supabase
+    const { error } = await supabase
       .from('tasks')
       .insert({
         user_id:           userId,
@@ -948,16 +1102,12 @@ export default function HomeScreen() {
         scheduled_time:    scheduledTime,
         duration_minutes:  durationMinutes,
         time_period:       getTimePeriod(scheduledTime),
-      })
-      .select('*')
-      .single();
-    if (error || !row) { console.error(error); return; }
+        notes:             details,
+      });
+    if (error) { console.error(error); return; }
 
-    if (row.date === toISODate(selectedDate)) {
-      setTasks(prev => sortByTime([...prev, rowToTask(row)]));
-    }
-    setCatTasks(prev => sortByDateThenTime([...prev, rowToTask(row)]));
-  }, [userId, selectedDate]);
+    await refreshAll();
+  }, [userId, refreshAll]);
 
   const addTasks = useCallback(async (suggested: SuggestedTask[]) => {
     if (!userId) return;
@@ -966,7 +1116,7 @@ export default function HomeScreen() {
       const matchedCat = categories.find(c => c.name.toLowerCase() === s.categoryName?.toLowerCase());
       const scheduledTime = s.scheduledTime ? `${s.scheduledTime}:00` : null;
       const date = s.date ?? today;
-      const { data: row, error } = await supabase
+      const { error } = await supabase
         .from('tasks')
         .insert({
           user_id:           userId,
@@ -976,19 +1126,86 @@ export default function HomeScreen() {
           scheduled_time:    scheduledTime,
           duration_minutes:  s.durationMinutes ?? null,
           time_period:       getTimePeriod(scheduledTime),
-        })
-        .select('*')
-        .single();
-      if (error || !row) { console.error(error); continue; }
-      if (row.date === toISODate(selectedDate)) {
-        setTasks(prev => sortByTime([...prev, rowToTask(row)]));
-      }
-      setCatTasks(prev => sortByDateThenTime([...prev, rowToTask(row)]));
+        });
+      if (error) console.error(error);
     }
-  }, [userId, categories, selectedDate]);
+    await refreshAll();
+  }, [userId, categories, refreshAll]);
+
+  // ── Task details modal + timer ──────────────────────────────────────────────
+  const findTask = useCallback((id: string | null): Task | null =>
+    id ? (tasks.find(t => t.id === id) ?? catTasks.find(t => t.id === id) ?? null) : null, [tasks, catTasks]);
+  const detailTask = findTask(detailTaskId);
+
+  const startTimerFor = useCallback((task: Task) => {
+    const begin = () => updateTimer(newTimer({ id: task.id, title: task.title, ruleId: task.recurringRuleId }));
+    if (timer && timer.taskId !== task.id) {
+      Alert.alert('Replace running timer?', `This will discard the timer on "${timer.title}".`, [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Replace', style: 'destructive', onPress: begin },
+      ]);
+    } else {
+      begin();
+    }
+  }, [timer, updateTimer]);
+
+  // Same completion path as the checkbox; recurring series also get the
+  // elapsed time logged (one-offs are completed but nothing is logged).
+  const completeFromTimer = useCallback(async () => {
+    if (!timer) return;
+    const task = findTask(timer.taskId);
+    const seconds = Math.round(elapsedMs(timer) / 1000);
+    await setTaskCompleted(timer.taskId, true);
+    const ruleId = task?.recurringRuleId ?? timer.ruleId;
+    if (ruleId) {
+      const { error } = await supabase.rpc('log_recurring_run', { p_rule_id: ruleId, p_seconds: seconds });
+      if (error) { console.error(error); Alert.alert('Completed, but time not logged', error.message); }
+      loadRules();
+    }
+    updateTimer(null);
+    setDetailTaskId(null);
+  }, [timer, findTask, setTaskCompleted, loadRules, updateTimer]);
+
+  const openTimerPicker = useCallback(async () => {
+    if (timer) { setDetailTaskId(timer.taskId); return; }
+    if (!userId) return;
+    const week = weekDatesSunday(new Date());
+    // Recurring instances are generated lazily per day; make sure the whole week exists first.
+    for (const iso of week) await generateTasksForDate(userId, iso);
+    const { data, error } = await supabase
+      .from('tasks').select('*').eq('user_id', userId)
+      .gte('date', week[0]).lte('date', week[6]).eq('is_completed', false)
+      .order('date', { ascending: true }).order('scheduled_time', { ascending: true });
+    if (error) { console.error(error); return; }
+    setPickerTasks((data ?? []).map(rowToTask));
+    setShowTimerPicker(true);
+  }, [timer, userId]);
+
+  const pickerOptions: TimerPickOption[] = useMemo(() => pickerTasks.map(t => ({
+    id: t.id, label: t.title,
+    dayLabel: t.date === toISODate(new Date()) ? 'Today' : new Date(`${t.date}T00:00:00`).toLocaleDateString('en-US', { weekday: 'short' }),
+  })), [pickerTasks]);
+
+  const startFromPicker = useCallback(async (pick: { taskId: string } | { newTaskTitle: string }) => {
+    if (!userId) return;
+    if ('taskId' in pick) {
+      const t = pickerTasks.find(x => x.id === pick.taskId);
+      if (t) updateTimer(newTimer({ id: t.id, title: t.title, ruleId: t.recurringRuleId }));
+    } else {
+      const today = toISODate(new Date());
+      const { data: row, error } = await supabase.from('tasks')
+        .insert({ user_id: userId, title: pick.newTaskTitle, category_id: null, date: today, time_period: 'unscheduled' })
+        .select('*').single();
+      if (error || !row) { console.error(error); return; }
+      updateTimer(newTimer({ id: row.id, title: row.title, ruleId: null }));
+      await refreshAll();
+    }
+    setShowTimerPicker(false);
+  }, [userId, pickerTasks, updateTimer, refreshAll]);
 
   const byPeriod = (p: TimePeriod) => tasks.filter(t => t.timePeriod === p && !t.isTTFO);
   const ttfo        = tasks.filter(t => t.isTTFO);
+  const freeBlocks  = useMemo(() => showFree ? computeFreeBlocks(tasks) : undefined, [showFree, tasks]);
   const allComplete = tasks.length > 0 && tasks.filter(t => !t.isTTFO).every(t => t.isCompleted);
 
   return (
@@ -1002,6 +1219,9 @@ export default function HomeScreen() {
         activeView={activeView}
         onToggleParty={() => setActiveView(v => v === 'party' ? 'home' : 'party')}
         onToggleBattle={() => setActiveView(v => v === 'battle' ? 'home' : 'battle')}
+        timerActive={!!timer}
+        timerRunning={isRunning(timer)}
+        onPressTimer={openTimerPicker}
       />
       <View style={s.divider} />
       <VerseCard verse={verse} />
@@ -1031,14 +1251,22 @@ export default function HomeScreen() {
             />
           )}
 
-          <PeriodGroup period="morning"     tasks={byPeriod('morning')}     categoryIconMap={categoryIconMap} onToggle={toggle} onLongPress={setActionTask} />
-          <PeriodGroup period="afternoon"   tasks={byPeriod('afternoon')}   categoryIconMap={categoryIconMap} onToggle={toggle} onLongPress={setActionTask} />
-          <PeriodGroup period="evening"     tasks={byPeriod('evening')}     categoryIconMap={categoryIconMap} onToggle={toggle} onLongPress={setActionTask} />
-          <PeriodGroup period="unscheduled" tasks={byPeriod('unscheduled')} categoryIconMap={categoryIconMap} onToggle={toggle} onLongPress={setActionTask} />
+          {/* FREE TIME toggle */}
+          <TouchableOpacity style={s.freeToggleRow} onPress={toggleFree} activeOpacity={0.7}>
+            <Text style={s.freeToggleTxt}>FREE TIME</Text>
+            <View style={[s.freeToggleBox, showFree && s.freeToggleBoxOn]}>
+              {showFree && <Text style={[s.checkmark, { fontSize: 7, marginTop: 0 }]}>✓</Text>}
+            </View>
+          </TouchableOpacity>
+
+          <PeriodGroup period="morning"     tasks={byPeriod('morning')}     categoryIconMap={categoryIconMap} onToggle={toggle} onLongPress={setActionTask} onOpen={t => setDetailTaskId(t.id)} freeBlocks={freeBlocks} />
+          <PeriodGroup period="afternoon"   tasks={byPeriod('afternoon')}   categoryIconMap={categoryIconMap} onToggle={toggle} onLongPress={setActionTask} onOpen={t => setDetailTaskId(t.id)} freeBlocks={freeBlocks} />
+          <PeriodGroup period="evening"     tasks={byPeriod('evening')}     categoryIconMap={categoryIconMap} onToggle={toggle} onLongPress={setActionTask} onOpen={t => setDetailTaskId(t.id)} freeBlocks={freeBlocks} />
+          <PeriodGroup period="unscheduled" tasks={byPeriod('unscheduled')} categoryIconMap={categoryIconMap} onToggle={toggle} onLongPress={setActionTask} onOpen={t => setDetailTaskId(t.id)} />
 
           {allComplete && <RelaxRow />}
 
-          <TTFOSection tasks={ttfo} categoryIconMap={categoryIconMap} onToggle={toggle} onLongPress={setActionTask} />
+          <TTFOSection tasks={ttfo} categoryIconMap={categoryIconMap} onToggle={toggle} onLongPress={setActionTask} onOpen={t => setDetailTaskId(t.id)} />
           <Footer
             tasks={tasks}
             onEndDay={() => router.push({ pathname: '/dot-chat', params: { mode: 'evening' } })}
@@ -1059,6 +1287,8 @@ export default function HomeScreen() {
           onEditCategory={updateCategory}
           onDeleteCategory={removeCategory}
           onDeleteCompleted={deleteCompletedTasks}
+          rules={rules}
+          onOpenTask={t => setDetailTaskId(t.id)}
         />
       )}
 
@@ -1079,7 +1309,29 @@ export default function HomeScreen() {
           date: editingTask.date,
           scheduledTime: editingTask.scheduledTime,
           durationMinutes: editingTask.durationMins,
+          details: editingTask.details ?? null,
         } as EditableTask : null}
+      />
+      <TaskDetailModal
+        visible={!!detailTaskId}
+        title={detailTask?.title ?? timer?.title ?? ''}
+        details={detailTask?.details}
+        isRecurring={!!(detailTask?.isRecurring ?? timer?.ruleId)}
+        timer={timer && timer.taskId === detailTaskId ? timer : null}
+        onClose={() => setDetailTaskId(null)}
+        onEdit={() => {
+          if (detailTask) { setEditingTask(detailTask); setDetailTaskId(null); setShowAddTask(true); }
+        }}
+        onStart={() => { if (detailTask) startTimerFor(detailTask); }}
+        onStop={() => { if (timer) updateTimer(stopTimer(timer)); }}
+        onResume={() => { if (timer) updateTimer(resumeTimer(timer)); }}
+        onComplete={completeFromTimer}
+      />
+      <TimerPickerModal
+        visible={showTimerPicker}
+        options={pickerOptions}
+        onClose={() => setShowTimerPicker(false)}
+        onStart={startFromPicker}
       />
       <TaskActionSheet
         visible={!!actionTask}
@@ -1169,6 +1421,21 @@ const s = StyleSheet.create({
   cardContent:  { flex: 1 },
   cardTitle:    { fontFamily: 'VT323', fontSize: 18, color: INK, lineHeight: 20 },
   cardTitleDone:{ textDecorationLine: 'line-through' },
+  titleRow:     { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  titleFlex:    { flexShrink: 1 },
+
+  timerBtn:     { width: 36, height: 36, borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, alignItems: 'center', justifyContent: 'center', backgroundColor: BG },
+  timerBtnOn:   { backgroundColor: INK },
+  timerDot:     { position: 'absolute', top: 1, right: 3, fontFamily: 'PressStart2P', fontSize: 6, color: GREEN, lineHeight: 8 },
+
+  freeToggleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', gap: 8, paddingHorizontal: MARGIN, paddingBottom: 4 },
+  freeToggleBox: { width: 12, height: 12, borderWidth: BORDER, borderColor: INK, alignItems: 'center', justifyContent: 'center' },
+  freeToggleBoxOn: { backgroundColor: INK },
+  freeToggleTxt: { fontFamily: 'PressStart2P', fontSize: 6, color: MUTED, lineHeight: 9 },
+
+  freeCard:  { flexDirection: 'row', alignItems: 'center', marginHorizontal: MARGIN, marginBottom: 6, paddingHorizontal: 12, paddingVertical: 8, borderWidth: BORDER, borderStyle: 'dotted', borderColor: MUTED, borderRadius: RADIUS, gap: 12 },
+  freeIcon:  { width: 52, height: 48, alignItems: 'center', justifyContent: 'center' },
+  freeTitle: { fontFamily: 'PressStart2P', fontSize: 7, color: MUTED, lineHeight: 11, letterSpacing: 1 },
   cardSub:      { fontFamily: 'PressStart2P', fontSize: 6, color: MUTED, lineHeight: 9, marginTop: 2 },
 
   ttfoWrap:  { marginTop: 4 },

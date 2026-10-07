@@ -11,37 +11,68 @@ const FILLED    = '#2A9D4A';
 const UNFILLED  = '#D9D9D9';
 const RESTART_GRAY = '#8E8E93';
 
-const STORAGE_KEY = 'battle:streak';
+// v1 stored only a count under 'battle:streak'. v2 stores one entry per
+// completed box: its completion date (M/D label source) or null for boxes
+// completed before dates were recorded — those stay unlabeled, never invented.
+const LEGACY_KEY  = 'battle:streak';
+const STORAGE_KEY = 'battle:streak:v2';
 const TOTAL = 100;
 const COLS = 10;
 const CELL = 22;
 const GAP = 8;
+const LABEL_H = 14; // reserved under every cell so the grid never shifts as boxes complete
+
+function todayLabelDate(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${(d.getMonth() + 1).toString().padStart(2, '0')}-${d.getDate().toString().padStart(2, '0')}`;
+}
+
+// "2026-10-07" -> "10/7"
+function monthDay(iso: string): string {
+  const [, m, d] = iso.split('-').map(Number);
+  return `${m}/${d}`;
+}
 
 export default function BattleView() {
-  const [streak, setStreak] = useState(0);
+  const [days, setDays] = useState<(string | null)[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const streak = days.length;
 
   useEffect(() => {
-    AsyncStorage.getItem(STORAGE_KEY).then(v => {
-      setStreak(v ? parseInt(v, 10) : 0);
-      setLoaded(true);
-    });
+    (async () => {
+      try {
+        const v2 = await AsyncStorage.getItem(STORAGE_KEY);
+        if (v2) {
+          const parsed = JSON.parse(v2);
+          if (Array.isArray(parsed)) { setDays(parsed.slice(0, TOTAL)); return; }
+        }
+        // First run after the upgrade: carry the existing streak over as
+        // undated boxes. The legacy key is left in place untouched.
+        const legacy = await AsyncStorage.getItem(LEGACY_KEY);
+        const count = legacy ? Math.max(0, Math.min(TOTAL, parseInt(legacy, 10) || 0)) : 0;
+        const migrated: (string | null)[] = Array(count).fill(null);
+        setDays(migrated);
+        await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
+      } finally {
+        setLoaded(true);
+      }
+    })();
   }, []);
 
-  const persist = useCallback(async (next: number) => {
-    setStreak(next);
-    await AsyncStorage.setItem(STORAGE_KEY, String(next));
+  const persist = useCallback(async (next: (string | null)[]) => {
+    setDays(next);
+    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next));
   }, []);
 
   const onVictory = () => {
     if (streak >= TOTAL) return;
-    persist(Math.min(TOTAL, streak + 1));
+    persist([...days, todayLabelDate()]);
   };
 
   const onRestart = () => {
     Alert.alert('Reset your streak back to 0?', undefined, [
       { text: 'Cancel', style: 'cancel' },
-      { text: 'Reset', style: 'destructive', onPress: () => persist(0) },
+      { text: 'Reset', style: 'destructive', onPress: () => persist([]) },
     ]);
   };
 
@@ -59,7 +90,10 @@ export default function BattleView() {
       ) : (
         <View style={s.grid}>
           {Array.from({ length: TOTAL }).map((_, i) => (
-            <View key={i} style={[s.cell, { backgroundColor: i < streak ? FILLED : UNFILLED }]} />
+            <View key={i} style={s.cellWrap}>
+              <View style={[s.cell, { backgroundColor: i < streak ? FILLED : UNFILLED }]} />
+              <Text style={s.cellLabel} numberOfLines={1}>{i < streak && days[i] ? monthDay(days[i]!) : ' '}</Text>
+            </View>
           ))}
         </View>
       )}
@@ -86,7 +120,10 @@ const s = StyleSheet.create({
   counter: { fontFamily: 'PressStart2P', fontSize: 7, color: MUTED, lineHeight: 10, marginBottom: 16 },
   praise:  { fontFamily: 'PressStart2P', fontSize: 16, color: INK, lineHeight: 26, textAlign: 'center', marginTop: 60, marginBottom: 60 },
 
+  // Row gap is just GAP; the label's own reserved height sits inside each wrapper.
   grid: { width: GRID_WIDTH, flexDirection: 'row', flexWrap: 'wrap', gap: GAP, marginBottom: 24 },
+  cellWrap:  { width: CELL, alignItems: 'center' },
+  cellLabel: { width: CELL + GAP, height: LABEL_H, fontFamily: 'VT323', fontSize: 12, lineHeight: LABEL_H, color: MUTED, textAlign: 'center' },
   cell: { width: CELL, height: CELL, borderRadius: 2 },
 
   actions:    { width: '100%', maxWidth: 309, alignItems: 'center', gap: 16 },

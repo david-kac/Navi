@@ -148,6 +148,9 @@ export type Database = {
           goal_id: string | null
           id: string
           is_active: boolean
+          notes: string | null
+          run_count: number
+          total_actual_seconds: number
           rule_type: string
           scheduled_time: string | null
           time_period: string
@@ -162,6 +165,9 @@ export type Database = {
           goal_id?: string | null
           id?: string
           is_active?: boolean
+          notes?: string | null
+          run_count?: number
+          total_actual_seconds?: number
           rule_type: string
           scheduled_time?: string | null
           time_period?: string
@@ -176,6 +182,9 @@ export type Database = {
           goal_id?: string | null
           id?: string
           is_active?: boolean
+          notes?: string | null
+          run_count?: number
+          total_actual_seconds?: number
           rule_type?: string
           scheduled_time?: string | null
           time_period?: string
@@ -319,7 +328,10 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
-      [_ in never]: never
+      log_recurring_run: {
+        Args: { p_rule_id: string; p_seconds: number }
+        Returns: undefined
+      }
     }
     Enums: {
       [_ in never]: never

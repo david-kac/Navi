@@ -1,7 +1,7 @@
 import React, { useRef, useState, useCallback, useEffect, useMemo } from 'react';
 import {
   Modal, View, Text, TextInput, TouchableOpacity,
-  StyleSheet, KeyboardAvoidingView, Platform, TouchableWithoutFeedback,
+  StyleSheet, KeyboardAvoidingView, Platform, TouchableWithoutFeedback, Keyboard, useWindowDimensions,
   ScrollView, NativeSyntheticEvent, NativeScrollEvent, Alert, ActivityIndicator,
 } from 'react-native';
 import { ChevronDown, RefreshCw, Calendar, Paperclip, X } from 'lucide-react-native';
@@ -25,7 +25,8 @@ const HOURS   = ['12','01','02','03','04','05','06','07','08','09','10','11'];
 const MINUTES = ['00','05','10','15','20','25','30','35','40','45','50','55'];
 const PERIODS = ['AM','PM'];
 const ITEM_H  = 60;
-const WEEK_DAYS = ['Mo','Tu','We','Th','Fr','Sa','Su'];
+// Sunday-first so a day's index equals JS getDay() / days_of_week storage (0=Sun).
+const WEEK_DAYS = ['Su','Mo','Tu','We','Th','Fr','Sa'];
 
 type RepeatType = 'daily' | 'weekly' | 'monthly';
 type Panel = 'main' | 'category' | 'time' | 'endTime' | 'date' | 'upload';
@@ -43,6 +44,9 @@ export interface NewTask {
   startTime:   string;
   duration:    string;
   isRecurring: boolean;
+  ruleType?:   'daily' | 'weekly'; // only meaningful when isRecurring
+  daysOfWeek?: number[];           // 0=Sun…6=Sat, only for weekly
+  details?:    string;
 }
 
 function toISODate(d: Date): string {
@@ -145,6 +149,7 @@ export interface EditableTask {
   date:             string | null; // "YYYY-MM-DD", null = no date set
   scheduledTime?:   string; // "HH:MM" or "HH:MM:SS", 24-hour
   durationMinutes?: number;
+  details?:         string | null;
 }
 
 interface Props {
@@ -327,6 +332,7 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
   const options = categories && categories.length > 0 ? categories : DEFAULT_CATEGORIES;
 
   const [title,       setTitle]       = useState('');
+  const [details,     setDetails]     = useState('');
   const [categoryId,  setCategoryId]  = useState(options[0]?.id ?? '');
   const [date,        setDate]        = useState<Date | null>(new Date());
   const [duration,    setDuration]    = useState('');
@@ -354,6 +360,19 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
   const [analyzing,        setAnalyzing]        = useState(false);
   const [suggestedTasks,   setSuggestedTasks]   = useState<SuggestedTask[]>([]);
   const [showPreview,      setShowPreview]      = useState(false);
+
+  // Category list height: cap it to what's actually visible above the keyboard
+  // so the list always scrolls instead of growing past the screen.
+  const { height: winH } = useWindowDimensions();
+  const [kbH, setKbH] = useState(0);
+  useEffect(() => {
+    const showEvt = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvt = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+    const a = Keyboard.addListener(showEvt, e => setKbH(e.endCoordinates.height));
+    const b = Keyboard.addListener(hideEvt, () => setKbH(0));
+    return () => { a.remove(); b.remove(); };
+  }, []);
+  const catListMaxH = Math.max(160, Math.min(360, winH - kbH - 240));
 
   const selectedCat    = options.find(c => c.id === categoryId) ?? options[0];
   const startTimeLabel = timeSet ? `${hour}:${minute} ${period}` : '--:-- --';
@@ -384,6 +403,7 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
 
     if (editingTask) {
       setTitle(editingTask.title);
+      setDetails(editingTask.details ?? '');
       setCategoryId(editingTask.categoryId ?? OPEN_CATEGORY_ID);
       setDuration(editingTask.durationMinutes ? String(editingTask.durationMinutes) : '');
       setDate(editingTask.date ? new Date(`${editingTask.date}T00:00:00`) : null);
@@ -430,7 +450,7 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
   };
 
   const reset = () => {
-    setTitle(''); setDuration(''); setIsRecurring(false);
+    setTitle(''); setDetails(''); setDuration(''); setIsRecurring(false);
     setRepeatType('daily'); setInterval('1'); setSelectedDays(new Set());
     setHour('08'); setMinute('00'); setPeriod('AM'); setTimeSet(false);
     setEndHour('08'); setEndMinute('30'); setEndPeriod('AM'); setEndTimeSet(false);
@@ -518,6 +538,11 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
       startTime:   timeSet ? `${hour}:${minute} ${period}` : '',
       duration,
       isRecurring,
+      ruleType:   isRecurring && repeatType === 'weekly' ? 'weekly' : 'daily',
+      daysOfWeek: isRecurring && repeatType === 'weekly' && selectedDays.size > 0
+        ? Array.from(selectedDays).sort()
+        : isRecurring && repeatType === 'weekly' && date ? [date.getDay()] : undefined,
+      details:    details.trim(),
     };
     if (editingTask) {
       onSave?.(editingTask.id, payload);
@@ -561,7 +586,7 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
               <Text style={s.header}>{editingTask ? 'EDIT TASK' : 'ADD TASK'}</Text>
 
               {/* Category dropdown */}
-              <TouchableOpacity style={s.catDropdown} onPress={() => setPanel('category')} activeOpacity={0.8}>
+              <TouchableOpacity style={s.catDropdown} onPress={() => { Keyboard.dismiss(); setPanel('category'); }} activeOpacity={0.8}>
                 <Text style={s.catText}>{selectedCat?.name.toUpperCase() ?? 'NO CATEGORY'}</Text>
                 <ChevronDown size={12} color={INK} strokeWidth={2} />
               </TouchableOpacity>
@@ -655,6 +680,20 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
                 </View>
               </View>
 
+              {/* DETAILS */}
+              <View style={{ gap: 5 }}>
+                <Text style={s.fieldLabel}>DETAILS</Text>
+                <TextInput
+                  style={s.detailsInput}
+                  placeholder="Notes, links, steps..."
+                  placeholderTextColor={MUTED}
+                  value={details}
+                  onChangeText={setDetails}
+                  multiline
+                  textAlignVertical="top"
+                />
+              </View>
+
               {/* SAVE/ADD + CANCEL */}
               <View style={s.btnRow}>
                 <TouchableOpacity style={s.addBtn} onPress={handleAdd} activeOpacity={0.8}>
@@ -696,7 +735,12 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
                   <Text style={s.backTxt}>← BACK</Text>
                 </TouchableOpacity>
               </View>
-              <ScrollView style={s.catList} showsVerticalScrollIndicator={false}>
+              <ScrollView
+                style={[s.catList, { maxHeight: catListMaxH }]}
+                showsVerticalScrollIndicator={false}
+                keyboardShouldPersistTaps="handled"
+                nestedScrollEnabled
+              >
                 {options.map(cat => (
                   <TouchableOpacity
                     key={cat.id}
@@ -943,13 +987,18 @@ const s = StyleSheet.create({
     paddingHorizontal: 10, paddingTop: 10,
     fontFamily: 'VT323', fontSize: 16, color: INK,
   },
+  detailsInput: {
+    height: 64, borderWidth: BORDER, borderColor: INK, borderRadius: 2,
+    paddingHorizontal: 10, paddingTop: 8,
+    fontFamily: 'VT323', fontSize: 16, color: INK,
+  },
   uploadTitle: { fontFamily: 'VT323', fontSize: 16, color: INK, lineHeight: 18 },
   uploadSub:   { fontFamily: 'PressStart2P', fontSize: 5, color: MUTED, lineHeight: 8, marginTop: 2 },
 
   panelHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   backTxt:     { fontFamily: 'PressStart2P', fontSize: 6, color: MUTED, lineHeight: 9 },
 
-  catList:          { maxHeight: 360 },
+  catList:          { flexGrow: 0 },
   catOption:        { borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, paddingHorizontal: 14, paddingVertical: 13, marginBottom: 14 },
   catOptionActive:  { backgroundColor: INK },
   catOptionTxt:     { fontFamily: 'VT323', fontSize: 18, color: INK, lineHeight: 20 },

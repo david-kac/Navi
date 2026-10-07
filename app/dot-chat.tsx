@@ -6,7 +6,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter, useLocalSearchParams } from 'expo-router';
-import { ChevronLeft, AlertTriangle, CheckCircle2, Paperclip, X } from 'lucide-react-native';
+import { ChevronLeft, Paperclip, X } from 'lucide-react-native';
 import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
@@ -16,9 +16,9 @@ import { supabase } from '../lib/supabase';
 import { useAuth } from '../lib/AuthProvider';
 import { buildDotSystemPrompt, runPlannerTurn, AnthropicMessage, AddTaskToolInput, UpdateTaskToolInput, DeleteTaskToolInput, AddCategoryToolInput, GetTasksByDateRangeToolInput, GetTasksByCategoryToolInput } from '../lib/ai';
 import { detectConflicts, Conflict, TaskSlot } from '../lib/conflicts';
-import { generateTasksForDate } from '../lib/recurring';
-import { shouldShowMorningFlow, markMorningFlowShown } from '../lib/morningGate';
-import { getVerseOfTheDay, Verse } from '../lib/verseOfTheDay';
+import { generateTasksForDate, virtualOccurrences, materializeVirtual, MATERIALIZE_AHEAD_DAYS, VIRTUAL_PREFIX } from '../lib/recurring';
+import { fmt12, formatTaskLine, formatCollapsed, seriesStats } from '../lib/chatFormat';
+import { RuleRow, cadenceLabel } from '../lib/cadence';
 import type { Database } from '../lib/database.types';
 import { getTimePeriod } from '../lib/database.types';
 
@@ -38,15 +38,9 @@ function toISODate(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
-function fmt12(hhmm: string): string {
-  const [h, m] = hhmm.split(':').map(Number);
-  const ap = h >= 12 ? 'PM' : 'AM';
-  const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
-  return `${h12}:${m.toString().padStart(2, '0')} ${ap}`;
-}
 
-type Mode = 'morning' | 'anytime' | 'evening';
-type Stage = 'loading' | 'chatting' | 'locked';
+type Mode = 'anytime' | 'evening';
+type Stage = 'loading' | 'chatting';
 
 interface DisplayMessage { id: string; kind: 'user' | 'dot' | 'added'; text: string }
 
@@ -80,12 +74,13 @@ async function fetchTodayState(userId: string, today: string): Promise<{ rows: T
   return { rows: taskRows, conflicts: detectConflicts(slots, isThursday) };
 }
 
-// Materializes recurring tasks for every day in the upcoming window, then
-// returns every task (today through 4 weeks out) so Dot can plan ahead —
-// not just react to what's already on today.
+// Returns every task from today through 4 weeks out so Dot can plan ahead.
+// Only today + MATERIALIZE_AHEAD_DAYS are written as real rows; later
+// occurrences of recurring series are computed from their rules (virtual rows,
+// ids `virtual:<ruleId>:<date>`) so opening chat doesn't flood the tasks table.
 async function fetchUpcomingTasks(userId: string, today: string): Promise<TaskRow[]> {
   const start = new Date(`${today}T00:00:00`);
-  for (let i = 0; i < UPCOMING_WINDOW_DAYS; i++) {
+  for (let i = 0; i <= MATERIALIZE_AHEAD_DAYS; i++) {
     await generateTasksForDate(userId, toISODate(addDays(start, i)));
   }
   const endDate = toISODate(addDays(start, UPCOMING_WINDOW_DAYS - 1));
@@ -99,7 +94,13 @@ async function fetchUpcomingTasks(userId: string, today: string): Promise<TaskRo
     .order('date', { ascending: true })
     .order('scheduled_time', { ascending: true });
   if (error) { console.error(error); return []; }
-  return (rows ?? []) as TaskRow[];
+  const real = (rows ?? []) as TaskRow[];
+
+  const rules = Object.values(await fetchRules(userId));
+  const existing = new Set(real.filter(r => r.recurring_rule_id).map(r => `${r.recurring_rule_id}|${r.date}`));
+  const virtual = await virtualOccurrences(userId, rules, toISODate(addDays(start, MATERIALIZE_AHEAD_DAYS + 1)), endDate, existing);
+  return [...real, ...virtual].sort((a, b) =>
+    (a.date ?? '').localeCompare(b.date ?? '') || (a.scheduled_time ?? '99').localeCompare(b.scheduled_time ?? '99'));
 }
 
 // Plain-language done/missed/undecided breakdown fed into the evening
@@ -115,6 +116,12 @@ function formatEodBreakdown(rows: TaskRow[]): string {
     `MISSED:\n${missed.length ? missed.map(t => `- ${t}`).join('\n') : 'Nothing'}`,
     `STILL UNDECIDED:\n${ttfo.length ? ttfo.map(t => `- ${t}`).join('\n') : 'Nothing'}`,
   ].join('\n\n');
+}
+
+async function fetchRules(userId: string): Promise<Record<string, RuleRow>> {
+  const { data, error } = await supabase.from('recurring_task_rules').select('*').eq('user_id', userId).eq('is_active', true);
+  if (error) { console.error(error); return {}; }
+  return Object.fromEntries((data ?? []).map(r => [r.id, r as RuleRow]));
 }
 
 export default function DotChat() {
@@ -134,7 +141,6 @@ export default function DotChat() {
   useEffect(() => { categoriesRef.current = categories; }, [categories]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
-  const [conflicts, setConflicts] = useState<Conflict[]>([]);
   const systemPromptRef = useRef('');
   const historyRef = useRef<AnthropicMessage[]>([]);
   const scrollRef = useRef<ScrollView>(null);
@@ -150,6 +156,10 @@ export default function DotChat() {
   // tasks by title (+ date, if given) so a near-miss id doesn't silently
   // fail move/delete requests.
   const resolveTaskId = useCallback(async (taskId: string, currentTitle?: string, currentDate?: string): Promise<string | null> => {
+    if (taskId.startsWith(VIRTUAL_PREFIX) && userId) {
+      const real = await materializeVirtual(userId, taskId);
+      if (real) return real;
+    }
     const { data: direct } = await supabase.from('tasks').select('id').eq('id', taskId).maybeSingle();
     if (direct) return direct.id;
     if (!currentTitle || !userId) return null;
@@ -184,6 +194,7 @@ export default function DotChat() {
           scheduled_time:    scheduledTime,
           duration_minutes:  taskInput.durationMinutes ?? null,
           time_period:       getTimePeriod(scheduledTime),
+          ...(taskInput.details?.trim() ? { notes: taskInput.details.trim() } : {}),
         })
         .select('id')
         .single();
@@ -203,6 +214,7 @@ export default function DotChat() {
       scheduled_time:    scheduledTime,
       duration_minutes:  taskInput.durationMinutes ?? null,
       time_period:       getTimePeriod(scheduledTime),
+      notes:             taskInput.details?.trim() || null,
     });
 
     if (error) {
@@ -221,7 +233,7 @@ export default function DotChat() {
 
     const { data: current, error: currentError } = await supabase
       .from('tasks')
-      .select('title, date, scheduled_time, duration_minutes')
+      .select('title, date, scheduled_time, duration_minutes, recurring_rule_id')
       .eq('id', realId)
       .single();
     if (currentError || !current) {
@@ -243,6 +255,7 @@ export default function DotChat() {
       patch.time_period = getTimePeriod(patch.scheduled_time);
     }
     if (taskInput.durationMinutes !== undefined) patch.duration_minutes = taskInput.durationMinutes;
+    if (taskInput.details !== undefined) patch.notes = taskInput.details.trim() || null;
     if (taskInput.categoryName !== undefined) {
       const matched = categoriesRef.current.find(c => c.name.toLowerCase() === taskInput.categoryName!.toLowerCase());
       patch.category_id = matched?.id ?? null;
@@ -301,8 +314,25 @@ export default function DotChat() {
       console.error(error);
       return { success: false, message: `Failed to update task: ${error?.message ?? 'not found'}` };
     }
-    setDisplay(prev => [...prev, { id: `updated-${Date.now()}`, kind: 'added', text: `✎ Updated "${row.title}"` }]);
-    return { success: true, message: 'Task updated successfully.' };
+    // Changing the estimate for a whole series: update the rule (so future
+    // instances inherit it) and every upcoming incomplete instance.
+    let seriesNote = '';
+    if (taskInput.applyToSeries && current.recurring_rule_id) {
+      const seriesPatch: Database['public']['Tables']['recurring_task_rules']['Update'] = {};
+      if (taskInput.durationMinutes !== undefined) seriesPatch.duration_minutes = taskInput.durationMinutes;
+      if (taskInput.details !== undefined) seriesPatch.notes = taskInput.details.trim() || null;
+      if (Object.keys(seriesPatch).length) {
+        const { error: ruleError } = await supabase.from('recurring_task_rules').update(seriesPatch).eq('id', current.recurring_rule_id);
+        if (ruleError) return { success: false, message: `Updated this occurrence, but failed to update the series: ${ruleError.message}` };
+        const instancePatch: Database['public']['Tables']['tasks']['Update'] = {};
+        if (seriesPatch.duration_minutes !== undefined) instancePatch.duration_minutes = seriesPatch.duration_minutes;
+        if (seriesPatch.notes !== undefined) instancePatch.notes = seriesPatch.notes;
+        await supabase.from('tasks').update(instancePatch).eq('recurring_rule_id', current.recurring_rule_id).eq('is_completed', false).gte('date', toISODate(new Date()));
+        seriesNote = ' The whole series (and its upcoming instances) was updated too.';
+      }
+    }
+    setDisplay(prev => [...prev, { id: `updated-${Date.now()}`, kind: 'added', text: `✎ Updated "${row.title}"${seriesNote ? ' (series)' : ''}` }]);
+    return { success: true, message: `Task updated successfully.${seriesNote}` };
   }, [resolveTaskId, userId]);
 
   const executeDeleteTask = useCallback(async (taskInput: DeleteTaskToolInput): Promise<{ success: boolean; message: string }> => {
@@ -332,7 +362,6 @@ export default function DotChat() {
   const executeReviewSchedule = useCallback(async (): Promise<{ success: boolean; message: string }> => {
     if (!userId) return { success: false, message: 'Not signed in.' };
     const { conflicts: fresh } = await fetchTodayState(userId, toISODate(new Date()));
-    setConflicts(fresh);
     const message = fresh.length
       ? `Found ${fresh.length} conflict(s): ${fresh.map(c => c.message).join(' ')}`
       : 'No conflicts found — schedule looks clear.';
@@ -362,6 +391,8 @@ export default function DotChat() {
     return { success: true, message: 'Category created successfully.' };
   }, [userId]);
 
+  const catNameOf = useCallback((id: string | null) => categoriesRef.current.find(c => c.id === id)?.name, []);
+
   const executeGetTasksByDateRange = useCallback(async (input: GetTasksByDateRangeToolInput): Promise<{ success: boolean; message: string }> => {
     if (!userId) return { success: false, message: 'Not signed in.' };
     if (!/^\d{4}-\d{2}-\d{2}$/.test(input.startDate)) {
@@ -369,20 +400,12 @@ export default function DotChat() {
     }
     const endDate = input.endDate && /^\d{4}-\d{2}-\d{2}$/.test(input.endDate) ? input.endDate : input.startDate;
 
-    // Unlike a purely-past lookup, this range can extend into the future
-    // beyond what fetchUpcomingTasks already materialized — recurring tasks
-    // there won't exist as rows yet, so generate them first or they'd
-    // silently look like nothing's scheduled.
     const today = toISODate(new Date());
-    const genStart = input.startDate > today ? input.startDate : today;
-    if (genStart <= endDate) {
-      const MAX_GENERATE_DAYS = 90;
-      const start = new Date(`${genStart}T00:00:00`);
-      const requestedDays = Math.round((new Date(`${endDate}T00:00:00`).getTime() - start.getTime()) / 86400000) + 1;
-      const days = Math.min(requestedDays, MAX_GENERATE_DAYS);
-      for (let i = 0; i < days; i++) {
-        await generateTasksForDate(userId, toISODate(addDays(start, i)));
-      }
+    const nearEnd = toISODate(addDays(new Date(`${today}T00:00:00`), MATERIALIZE_AHEAD_DAYS));
+    // Only the near-term days are materialized as rows; anything further out
+    // is computed from the rules below.
+    for (let d = input.startDate > today ? input.startDate : today; d <= endDate && d <= nearEnd; d = toISODate(addDays(new Date(`${d}T00:00:00`), 1))) {
+      await generateTasksForDate(userId, d);
     }
 
     const { data, error } = await supabase
@@ -398,25 +421,47 @@ export default function DotChat() {
       return { success: false, message: `Failed to look up tasks: ${error.message}` };
     }
 
-    const rows = (data ?? []) as TaskRow[];
+    const realRows = (data ?? []) as TaskRow[];
+    const rules = await fetchRules(userId);
+    const futureFrom = input.startDate > nearEnd ? input.startDate : toISODate(addDays(new Date(`${nearEnd}T00:00:00`), 1));
+    const virtual = await virtualOccurrences(
+      userId, Object.values(rules), futureFrom, endDate,
+      new Set(realRows.filter(r => r.recurring_rule_id).map(r => `${r.recurring_rule_id}|${r.date}`)),
+    );
+    const rows = [...realRows, ...virtual].sort((a, b) =>
+      (a.date ?? '').localeCompare(b.date ?? '') || (a.scheduled_time ?? '99').localeCompare(b.scheduled_time ?? '99'));
     if (!rows.length) return { success: true, message: `No tasks found between ${input.startDate} and ${endDate}.` };
 
-    const lines = rows.map(r => {
-      const when = r.scheduled_time ? fmt12(r.scheduled_time) : 'unscheduled';
-      const status = r.is_ttfo ? 'undecided' : r.is_completed ? 'done' : 'not done';
-      return `- ${r.date} — ${r.title} — ${when} (${status})`;
-    }).join('\n');
-    return { success: true, message: lines };
-  }, [userId]);
+    // A single day lists each task as-is (completion is per-day). A multi-day
+    // range shows each recurring series once, summarizing its occurrences.
+    if (input.startDate === endDate) {
+      return { success: true, message: rows.map(r => formatTaskLine(r, { catName: catNameOf(r.category_id) ?? 'Open', rule: r.recurring_rule_id ? rules[r.recurring_rule_id] : undefined })).join('\n') };
+    }
+    const lines: string[] = [];
+    const bySeries = new Map<string, TaskRow[]>();
+    for (const r of rows) {
+      const rule = r.recurring_rule_id ? rules[r.recurring_rule_id] : undefined;
+      if (!rule) { lines.push(formatTaskLine(r, { catName: catNameOf(r.category_id) ?? 'Open' })); continue; }
+      bySeries.set(rule.id, [...(bySeries.get(rule.id) ?? []), r]);
+    }
+    bySeries.forEach((inst, ruleId) => {
+      const rule = rules[ruleId];
+      const done = inst.filter(i => i.is_completed).length;
+      const openDates = inst.filter(i => !i.is_completed).map(i => i.date).join(', ');
+      lines.push(`- [seriesId: ${rule.id}] RECURRING [${catNameOf(inst[0].category_id) ?? 'Open'}] ${rule.title} — ${cadenceLabel(rule)} — ${seriesStats(rule)} — ${inst.length} occurrences in range, ${done} done${openDates ? `; still open: ${openDates}` : ''}`);
+    });
+    return { success: true, message: lines.join('\n') };
+  }, [userId, catNameOf]);
 
   const executeGetUnscheduledTasks = useCallback(async (): Promise<{ success: boolean; message: string }> => {
     if (!userId) return { success: false, message: 'Not signed in.' };
+    // Every task with no date at all — any category or none, completed or not
+    // (completed tasks stay until the daily cleanup deletes them).
     const { data, error } = await supabase
       .from('tasks')
       .select('*')
       .eq('user_id', userId)
       .is('date', null)
-      .eq('is_completed', false)
       .order('title', { ascending: true });
     if (error) {
       console.error(error);
@@ -424,15 +469,10 @@ export default function DotChat() {
     }
 
     const rows = (data ?? []) as TaskRow[];
-    if (!rows.length) return { success: true, message: 'No unscheduled backlog tasks.' };
-
-    const lines = rows.map(r => {
-      const catName = categoriesRef.current.find(c => c.id === r.category_id)?.name ?? 'Open';
-      const when = r.scheduled_time ? ` — ${fmt12(r.scheduled_time)}` : '';
-      return `- [${catName}] ${r.title}${when}`;
-    }).join('\n');
-    return { success: true, message: lines };
-  }, [userId]);
+    if (!rows.length) return { success: true, message: 'No dateless tasks.' };
+    const rules = await fetchRules(userId);
+    return { success: true, message: formatCollapsed(rows, rules, catNameOf, toISODate(new Date()), { showCategory: true }).join('\n') };
+  }, [userId, catNameOf]);
 
   const executeGetTasksByCategory = useCallback(async (input: GetTasksByCategoryToolInput): Promise<{ success: boolean; message: string }> => {
     if (!userId) return { success: false, message: 'Not signed in.' };
@@ -443,8 +483,9 @@ export default function DotChat() {
       return { success: false, message: `No category named "${name}" — check the available categories and try again.` };
     }
 
-    let query = supabase.from('tasks').select('*').eq('user_id', userId).eq('is_completed', false);
+    let query = supabase.from('tasks').select('*').eq('user_id', userId);
     query = cat ? query.eq('category_id', cat.id) : query.is('category_id', null);
+    if (input.includeCompleted === false) query = query.eq('is_completed', false);
     const { data, error } = await query
       .order('date', { ascending: true, nullsFirst: false })
       .order('scheduled_time', { ascending: true });
@@ -454,14 +495,29 @@ export default function DotChat() {
     }
 
     const rows = (data ?? []) as TaskRow[];
-    if (!rows.length) return { success: true, message: `No incomplete tasks in "${name}".` };
+    if (!rows.length) return { success: true, message: `No tasks in "${name}".` };
+    const rules = await fetchRules(userId);
+    return { success: true, message: formatCollapsed(rows, rules, catNameOf, toISODate(new Date())).join('\n') };
+  }, [userId, catNameOf]);
 
-    const lines = rows.map(r => {
-      const when = `${r.date ?? 'no date'}${r.scheduled_time ? ` ${fmt12(r.scheduled_time)}` : ''}`;
-      return `- ${r.title} — ${when}`;
-    }).join('\n');
-    return { success: true, message: lines };
-  }, [userId]);
+  const executeGetAllTasks = useCallback(async (): Promise<{ success: boolean; message: string }> => {
+    if (!userId) return { success: false, message: 'Not signed in.' };
+    const { data, error } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('user_id', userId)
+      .order('date', { ascending: true, nullsFirst: false })
+      .order('scheduled_time', { ascending: true });
+    if (error) {
+      console.error(error);
+      return { success: false, message: `Failed to look up tasks: ${error.message}` };
+    }
+    const rows = (data ?? []) as TaskRow[];
+    if (!rows.length) return { success: true, message: 'No tasks exist.' };
+    const rules = await fetchRules(userId);
+    const lines = formatCollapsed(rows, rules, catNameOf, toISODate(new Date()), { showCategory: true });
+    return { success: true, message: `${lines.length} items (each recurring series listed once):\n${lines.join('\n')}` };
+  }, [userId, catNameOf]);
 
   const pickPhoto = async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -544,14 +600,7 @@ export default function DotChat() {
     const now = new Date();
     const today = toISODate(now);
 
-    let sessionMode: Mode;
-    if (modeParam === 'evening') {
-      sessionMode = 'evening';
-    } else {
-      const isMorning = await shouldShowMorningFlow();
-      sessionMode = isMorning ? 'morning' : 'anytime';
-      if (isMorning) await markMorningFlowShown();
-    }
+    const sessionMode: Mode = modeParam === 'evening' ? 'evening' : 'anytime';
     setMode(sessionMode);
 
     const { data: catRows } = await supabase.from('categories').select('*').eq('user_id', userId);
@@ -559,21 +608,15 @@ export default function DotChat() {
     setCategories(catRows ?? []);
 
     const { rows: todayRows, conflicts: detected } = await fetchTodayState(userId, today);
-    setConflicts(detected);
 
     const upcomingRows = await fetchUpcomingTasks(userId, today);
+    const rules = await fetchRules(userId);
     const upcomingTasks = upcomingRows.length
-      ? upcomingRows.map(r => {
-          const when = r.scheduled_time ? fmt12(r.scheduled_time) : 'unscheduled';
-          const dur = r.duration_minutes ? ` (${r.duration_minutes} min)` : '';
-          return `- [${r.id}] ${r.date} — ${r.title} — ${when}${dur}`;
-        }).join('\n')
+      ? upcomingRows.map(r => formatTaskLine(r) + (r.recurring_rule_id ? ' ↻' : '')).join('\n')
       : 'Nothing scheduled yet.';
-
-    let verse: Verse | undefined;
-    if (sessionMode === 'morning') {
-      verse = await getVerseOfTheDay();
-    }
+    const seriesSummary = Object.values(rules).length
+      ? Object.values(rules).map(rule => `- ${rule.title} — ${cadenceLabel(rule)} — ${seriesStats(rule)} [seriesId: ${rule.id}]`).join('\n')
+      : '';
 
     const system = buildDotSystemPrompt({
       date:       now.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }),
@@ -581,10 +624,10 @@ export default function DotChat() {
       dayOfWeek:  now.toLocaleDateString('en-US', { weekday: 'long' }),
       isThursday: now.getDay() === 4,
       upcomingTasks,
+      seriesSummary,
       conflicts:  detected.length ? detected.map(c => c.message).join('\n') : 'None.',
       categoryNames: (catRows ?? []).map(c => c.name),
       mode: sessionMode,
-      verse,
       eodBreakdown: sessionMode === 'evening' ? formatEodBreakdown(todayRows) : undefined,
     });
     systemPromptRef.current = system;
@@ -608,15 +651,13 @@ export default function DotChat() {
       console.error('Failed to load chat history:', e);
     }
 
-    const kickoff = sessionMode === 'morning'
-      ? "Give me my morning greeting, share today's verse exactly as written, and a quick summary of today. Keep it short."
-      : sessionMode === 'evening'
+    const kickoff = sessionMode === 'evening'
       ? "Give me my end-of-day wrap-up: summarize what I finished, what I missed, and anything still undecided today, then ask what I want to do with anything unfinished. Keep it warm and brief."
       : 'Just say a short casual hello and ask what\'s on my mind. Keep it to one sentence.';
 
     setSending(true);
     try {
-      const result = await runPlannerTurn(system, [], kickoff, { executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule, executeAddCategory, executeGetTasksByDateRange, executeGetUnscheduledTasks, executeGetTasksByCategory });
+      const result = await runPlannerTurn(system, [], kickoff, { executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule, executeAddCategory, executeGetTasksByDateRange, executeGetUnscheduledTasks, executeGetTasksByCategory, executeGetAllTasks });
       historyRef.current = result.history;
       setDisplay(prev => [...prev, { id: 'greet', kind: 'dot', text: result.replyText }]);
       setStage('chatting');
@@ -626,7 +667,7 @@ export default function DotChat() {
     } finally {
       setSending(false);
     }
-  }, [userId, modeParam, executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule, executeAddCategory, executeGetTasksByDateRange, executeGetUnscheduledTasks, executeGetTasksByCategory]);
+  }, [userId, modeParam, executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule, executeAddCategory, executeGetTasksByDateRange, executeGetUnscheduledTasks, executeGetTasksByCategory, executeGetAllTasks]);
 
   useEffect(() => { greet(); }, [userId, modeParam]);
 
@@ -651,7 +692,7 @@ export default function DotChat() {
     setInput('');
     setSending(true);
     try {
-      const result = await runPlannerTurn(systemPromptRef.current, historyRef.current, text, { executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule, executeAddCategory, executeGetTasksByDateRange, executeGetUnscheduledTasks, executeGetTasksByCategory });
+      const result = await runPlannerTurn(systemPromptRef.current, historyRef.current, text, { executeAddTask, executeUpdateTask, executeDeleteTask, executeReviewSchedule, executeAddCategory, executeGetTasksByDateRange, executeGetUnscheduledTasks, executeGetTasksByCategory, executeGetAllTasks });
       historyRef.current = result.history;
       setDisplay(prev => [...prev, { id: `a-${Date.now()}`, kind: 'dot', text: result.replyText }]);
     } catch (e) {
@@ -661,20 +702,13 @@ export default function DotChat() {
     }
   };
 
-  const lockPlan = async () => {
-    if (!userId) return;
-    const { conflicts: fresh } = await fetchTodayState(userId, toISODate(new Date()));
-    setConflicts(fresh);
-    setStage('locked');
-  };
-
   return (
     <SafeAreaView style={s.root}>
       <View style={s.header}>
         <TouchableOpacity onPress={() => router.back()} style={s.backBtn} activeOpacity={0.7}>
           <ChevronLeft size={16} color={INK} strokeWidth={2} />
         </TouchableOpacity>
-        <Text style={s.headerTitle}>{mode === 'morning' ? 'MORNING PLAN' : mode === 'evening' ? 'END OF DAY' : 'DOT'}</Text>
+        <Text style={s.headerTitle}>{mode === 'evening' ? 'END OF DAY' : 'DOT'}</Text>
       </View>
 
       {stage === 'loading' && (
@@ -738,11 +772,6 @@ export default function DotChat() {
             </TouchableOpacity>
           </View>
 
-          {mode === 'morning' && (
-            <TouchableOpacity style={s.lockBtn} onPress={lockPlan} activeOpacity={0.8}>
-              <Text style={s.lockBtnTxt}>LOCK PLAN</Text>
-            </TouchableOpacity>
-          )}
           {mode === 'evening' && (
             <TouchableOpacity style={s.lockBtn} onPress={() => router.back()} activeOpacity={0.8}>
               <Text style={s.lockBtnTxt}>DONE FOR TODAY</Text>
@@ -751,29 +780,6 @@ export default function DotChat() {
         </KeyboardAvoidingView>
       )}
 
-      {stage === 'locked' && (
-        <View style={s.lockedWrap}>
-          {conflicts.length === 0 ? (
-            <>
-              <CheckCircle2 size={32} color={INK} strokeWidth={1.5} />
-              <Text style={s.lockedHeadline}>No conflicts. Plan's locked.</Text>
-            </>
-          ) : (
-            <>
-              <AlertTriangle size={32} color={INK} strokeWidth={1.5} />
-              <Text style={s.lockedHeadline}>{conflicts.length} thing{conflicts.length > 1 ? 's' : ''} to talk through:</Text>
-              {conflicts.map((c, i) => (
-                <View key={i} style={s.conflictRow}>
-                  <Text style={s.conflictTxt}>{c.message}</Text>
-                </View>
-              ))}
-            </>
-          )}
-          <TouchableOpacity style={s.doneBtn} onPress={() => router.back()} activeOpacity={0.8}>
-            <Text style={s.doneBtnTxt}>BACK TO HOME</Text>
-          </TouchableOpacity>
-        </View>
-      )}
       <TaskPreviewModal
         visible={showPreview}
         tasks={suggestedTasks}
@@ -819,11 +825,4 @@ const s = StyleSheet.create({
 
   lockBtn: { margin: 18, backgroundColor: INK, borderRadius: RADIUS, paddingVertical: 13, alignItems: 'center' },
   lockBtnTxt: { fontFamily: 'PressStart2P', fontSize: 8, color: BG },
-
-  lockedWrap:    { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 12, paddingHorizontal: 24 },
-  lockedHeadline:{ fontFamily: 'PressStart2P', fontSize: 10, color: INK, textAlign: 'center' },
-  conflictRow:   { borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, padding: 12, width: '100%' },
-  conflictTxt:   { fontFamily: 'VT323', fontSize: 16, color: INK, lineHeight: 20 },
-  doneBtn:    { marginTop: 16, borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, paddingVertical: 12, paddingHorizontal: 24 },
-  doneBtnTxt: { fontFamily: 'PressStart2P', fontSize: 8, color: INK },
 });

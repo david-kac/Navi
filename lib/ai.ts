@@ -10,10 +10,10 @@ interface ScheduleContext {
   dayOfWeek: string;
   isThursday: boolean;
   upcomingTasks: string;
+  seriesSummary?: string;
   conflicts: string;
   categoryNames?: string[];
-  mode: 'morning' | 'anytime' | 'evening';
-  verse?: { text: string; reference: string };
+  mode: 'anytime' | 'evening';
   eodBreakdown?: string;
 }
 
@@ -27,16 +27,16 @@ DAVID'S CONTEXT:
 - Manhattan commute daily (~45 min each way)
 - Active side projects: Gather (app), freelance design, Dot, backyard
 - Available categories: ${ctx.categoryNames?.length ? ctx.categoryNames.join(', ') : '(none yet)'}
-${ctx.mode === 'morning' && ctx.verse ? `\nTODAY'S VERSE (quote this EXACTLY, word-for-word, never paraphrase or alter it):\n"${ctx.verse.text}" — ${ctx.verse.reference}\n` : ''}
-UPCOMING SCHEDULE — today through the next 4 weeks (each line shows the date and the task's id in brackets — use the id for update_task/delete_task, never say the raw id out loud):
+
+UPCOMING SCHEDULE — dated tasks from today through the next 4 weeks. Each line: [task id] then a status tag — [DONE] = checked off, [OPEN] = not done, [UNDECIDED] = in "things to figure out" — then title, date, time, duration. "↻" marks an instance of a recurring series; "details:" is the task's notes. Use the id for update_task/delete_task and never say it out loud:
 ${ctx.upcomingTasks || 'No tasks scheduled yet.'}
+${ctx.seriesSummary ? `\nRECURRING SERIES — one line per series (cadence, assigned time, and how long it actually takes on average from timed runs):\n${ctx.seriesSummary}\n` : ''}
+EVERY TASK YOU CAN SEE HAS A COMPLETION STATUS ([DONE]/[OPEN]/[UNDECIDED]) — you always know what is checked off. Completed tasks are not hidden; they stay until the daily cleanup deletes them. UPCOMING SCHEDULE only shows dated tasks inside the 4-week window, but you CAN see everything else through the lookup tools below (dateless tasks, tasks with no category, tasks in any category, any date range, completed tasks). Never tell David you can only see dated tasks — use a lookup tool.
 
 CONFLICTS DETECTED AT SESSION START (may be stale if you've made changes since — use review_schedule for a fresh check):
 ${ctx.conflicts || 'None.'}
 ${ctx.mode === 'evening' ? `\nTODAY'S BREAKDOWN — done / missed / still undecided:\n${ctx.eodBreakdown || 'Nothing tracked today.'}\n` : ''}
-SESSION TYPE: ${ctx.mode === 'morning'
-    ? 'This is the once-daily automatic morning session. Greet David, share TODAY\'S VERSE exactly as written, and give a short summary of today. End the conversation working toward a locked plan.'
-    : ctx.mode === 'evening'
+SESSION TYPE: ${ctx.mode === 'evening'
     ? "This is the end-of-day wrap-up session (David tapped END MY DAY). Start by summarizing TODAY'S BREAKDOWN above: briefly celebrate what got done, gently note what got missed (no guilt), and surface anything still undecided. Then, for each unfinished task, ask what David wants to do with it — move it to tomorrow, reschedule to a specific day/time, or drop it. Use update_task (with a new date/scheduledTime, or clearScheduledTime/clearDate to unschedule it) or delete_task (after confirming) based on his answer. If there's nothing unfinished, just celebrate and keep it short. End the conversation once every open item has been addressed or David says he's done — don't keep pushing after that."
     : 'This is an ad-hoc anytime chat (David tapped your avatar). Keep your opening line to one short casual line like "Hey, what\'s up?" — no verse, no full summary unless he asks for one.'}
 
@@ -62,6 +62,7 @@ TOOLS — update_task (moving/editing/rescheduling existing tasks — covers eve
 - When moving a task to a different day, the app checks the destination day for overlaps automatically. If update_task comes back reporting a conflict, do not retry with the same time — look at that day on UPCOMING SCHEDULE, propose a different open time instead, and wait for David to confirm before calling update_task again.
 - To move a task to a different category, set categoryName to an exact match from the available categories.
 - To clear a task's start time (send it to Unscheduled for that day) without removing its date, set clearScheduledTime true. To remove its date entirely (a fully dateless backlog item, no longer tied to any day), set clearDate true. These are explicit David requests only — never clear something he didn't ask to clear.
+- To change a task's details/notes, set details. To change a RECURRING task's estimate (or details) for the whole series and all its upcoming instances, set applyToSeries true — otherwise only that one occurrence changes.
 - Only change the fields David actually wants changed — omit the rest.
 - If multiple tasks could match what David said (e.g. a recurring task appears on several dates), ask which one he means instead of guessing.
 
@@ -81,20 +82,17 @@ TOOLS — add_category (creating a new category):
 - New categories get a generic default icon — tell David he can pick a different one later from the CATS tab if he wants.
 - Once created, the category is immediately usable as categoryName in add_task/update_task later in this same conversation.
 
-TOOLS — get_tasks_by_date_range (checking a specific day or range, past or future):
-- UPCOMING SCHEDULE above only covers today through the next 4 weeks. Whenever David asks about a specific day or range outside that window — before today ("what did I do last Tuesday", "did I get to X last week"), or further out than 4 weeks ("what's on my plate in October") — call get_tasks_by_date_range instead of guessing or saying you don't know.
-- Resolve whatever he said ("last Tuesday", "the 12th") to an actual startDate using today's date above; pass endDate too for a range.
-- Summarize what comes back in plain language once it returns.
+TOOLS — lookups (read-only, call freely, no confirmation needed). Every result includes completion status, details, and for recurring tasks the cadence plus assigned/average-actual time. Recurring tasks come back ONCE per series (not once per instance) except in a single-day lookup:
+- get_tasks_by_date_range: a specific day or range, past or future (before today, or past the 4-week window). Resolve "last Tuesday" etc. to real dates from today's date first.
+- get_unscheduled_tasks: every task with no date at all, whether or not it has a time or category, completed or not.
+- get_tasks_by_category: everything in one category regardless of date (dated, dateless, completed, open). categoryName must exactly match an available category, or "Open" for uncategorized. Pass includeCompleted false only if David wants just what's left.
+- get_all_tasks: every task that exists, any category, any date, completed or not. Use for broad questions ("what's on my plate overall", "find that thing about X") when you don't know where it lives.
+- Summarize results in plain language once they return.
 
-TOOLS — get_unscheduled_tasks (dateless backlog items):
-- UPCOMING SCHEDULE above only includes tasks that have a date. Tasks with no date at all (David explicitly cleared the date, or a stale-date sweep removed it) live in the backlog and are invisible above. Whenever David asks about backlog items, "stuff with no date", or open/unscheduled tasks not on his calendar, call get_unscheduled_tasks instead of assuming he has none.
-- Summarize what comes back in plain language.
-
-TOOLS — get_tasks_by_category (everything in one category, all-time):
-- UPCOMING SCHEDULE above only covers dated tasks in the next 4 weeks, so a category can have older or dateless tasks that don't show there. Whenever David asks about a specific category's tasks or workload — "what's on my Freelance list", "how much backyard stuff do I have" — call get_tasks_by_category instead of relying only on what's above.
-- categoryName must exactly match one of the available categories above, or "Open" for uncategorized tasks.
-- Only returns incomplete tasks (David's typical intent when asking what's "on" a category) — completed history for a category isn't covered by this tool.
-- Summarize what comes back in plain language.`;
+RECURRING TASK ESTIMATES:
+- For a recurring series with timed runs, compare assigned time to average actual time. Only if they differ by MORE than 15% (either direction) may you bring it up once, naturally, while that task is being discussed — e.g. "'Clean bathroom' usually takes 42 min but you've got 30 — want me to change it?". Within ±15% (e.g. assigned 100, actual 112) say nothing about it.
+- Never change an estimate without David's explicit yes. After he confirms, call update_task with durationMinutes (rounded to a whole minute) and applyToSeries true.
+- Series with no timed runs yet have no average — don't guess one.`;
 }
 
 // ─── Claude API call ──────────────────────────────────────────────────────────
@@ -230,6 +228,7 @@ const ADD_TASK_TOOL = {
       date:             { type: 'string', description: 'YYYY-MM-DD. Omit to default to today.' },
       scheduledTime:    { type: 'string', description: 'HH:MM 24-hour. Omit if no specific time was mentioned.' },
       durationMinutes:  { type: 'number', description: 'Omit if no duration was mentioned.' },
+      details:          { type: 'string', description: 'Optional notes/details for the task. Omit if none were given.' },
       isRecurring:      { type: 'boolean', description: 'True if the user said this repeats ("every day", "every Monday", "weekdays"). Omit or false for a one-off task.' },
       ruleType:         { type: 'string', enum: ['daily', 'weekly'], description: "Required if isRecurring is true. 'daily' for every day, 'weekly' for specific weekdays." },
       daysOfWeek:       { type: 'array', items: { type: 'number' }, description: "Required if ruleType is 'weekly'. Integers 0=Sunday...6=Saturday, e.g. weekdays = [1,2,3,4,5]." },
@@ -244,6 +243,7 @@ export interface AddTaskToolInput {
   date?: string;
   scheduledTime?: string;
   durationMinutes?: number;
+  details?: string;
   isRecurring?: boolean;
   ruleType?: 'daily' | 'weekly';
   daysOfWeek?: number[];
@@ -262,6 +262,8 @@ const UPDATE_TASK_TOOL = {
       date:               { type: 'string', description: 'New YYYY-MM-DD if moving to a different day. Omit if not changing.' },
       scheduledTime:      { type: 'string', description: 'New HH:MM 24-hour start time. Omit if not changing.' },
       durationMinutes:    { type: 'number', description: 'New duration in minutes. Omit if not changing.' },
+      details:            { type: 'string', description: 'New details/notes text (empty string clears them). Omit if not changing.' },
+      applyToSeries:      { type: 'boolean', description: "For a recurring task: true applies durationMinutes/details to the whole series and its upcoming instances, not just this occurrence. Only after David confirms." },
       categoryName:       { type: 'string', description: 'Move the task to this category. Must exactly match one of the available categories. Omit if not changing.' },
       clearScheduledTime: { type: 'boolean', description: 'True to remove the start time only, sending the task to Unscheduled for its date. Only set when the user explicitly asks to unschedule/clear the time.' },
       clearDate:          { type: 'boolean', description: 'True to remove the date entirely, making the task a dateless backlog item no longer tied to any day. Only set when the user explicitly asks to remove the date.' },
@@ -278,6 +280,8 @@ export interface UpdateTaskToolInput {
   date?: string;
   scheduledTime?: string;
   durationMinutes?: number;
+  details?: string;
+  applyToSeries?: boolean;
   categoryName?: string;
   clearScheduledTime?: boolean;
   clearDate?: boolean;
@@ -330,7 +334,7 @@ export interface AddCategoryToolInput {
 
 const GET_TASKS_BY_DATE_RANGE_TOOL = {
   name: 'get_tasks_by_date_range',
-  description: "Look up the user's tasks for a specific date or date range, past or future. Call this whenever the user asks about a day/week outside UPCOMING SCHEDULE's 4-week window instead of guessing.",
+  description: "Look up the user's tasks (with completion status) for a specific date or date range, past or future. Call this whenever the user asks about a day/week outside UPCOMING SCHEDULE's 4-week window instead of guessing.",
   input_schema: {
     type: 'object',
     properties: {
@@ -348,7 +352,7 @@ export interface GetTasksByDateRangeToolInput {
 
 const GET_UNSCHEDULED_TASKS_TOOL = {
   name: 'get_unscheduled_tasks',
-  description: "Look up the user's dateless backlog tasks — items with no date at all, which are NOT included in UPCOMING SCHEDULE (that only covers dated tasks). Call this whenever the user asks about backlog items or unscheduled tasks not on the calendar.",
+  description: "Look up every task with no date at all (any category or none, with or without a time, completed or not) — these are NOT in UPCOMING SCHEDULE. Call this whenever the user asks about backlog items or tasks not on the calendar.",
   input_schema: {
     type: 'object',
     properties: {},
@@ -357,11 +361,12 @@ const GET_UNSCHEDULED_TASKS_TOOL = {
 
 const GET_TASKS_BY_CATEGORY_TOOL = {
   name: 'get_tasks_by_category',
-  description: "Look up every incomplete task in one category, regardless of date — including tasks outside UPCOMING SCHEDULE's 4-week window. Call this whenever the user asks about a specific category's tasks or workload.",
+  description: "Look up every task in one category regardless of date (dated, dateless, completed or open), with completion status. Call this whenever the user asks about a specific category's tasks or workload.",
   input_schema: {
     type: 'object',
     properties: {
-      categoryName: { type: 'string', description: 'Must exactly match one of the available categories, or "Open" for uncategorized tasks.' },
+      categoryName:     { type: 'string', description: 'Must exactly match one of the available categories, or "Open" for uncategorized tasks.' },
+      includeCompleted: { type: 'boolean', description: 'Defaults to true. Set false to return only tasks that are not done.' },
     },
     required: ['categoryName'],
   },
@@ -369,7 +374,17 @@ const GET_TASKS_BY_CATEGORY_TOOL = {
 
 export interface GetTasksByCategoryToolInput {
   categoryName: string;
+  includeCompleted?: boolean;
 }
+
+const GET_ALL_TASKS_TOOL = {
+  name: 'get_all_tasks',
+  description: "List every task that currently exists (not deleted) — any category or none, any date or none, completed or not — with completion status. Recurring series appear once each. Use for broad questions or when you don't know where a task lives.",
+  input_schema: {
+    type: 'object',
+    properties: {},
+  },
+};
 
 async function callClaudeRaw(
   systemPrompt: string,
@@ -391,7 +406,7 @@ async function callClaudeRaw(
       max_tokens: maxTokens,
       system:     systemPrompt,
       messages,
-      tools:      [ADD_TASK_TOOL, UPDATE_TASK_TOOL, DELETE_TASK_TOOL, REVIEW_SCHEDULE_TOOL, ADD_CATEGORY_TOOL, GET_TASKS_BY_DATE_RANGE_TOOL, GET_UNSCHEDULED_TASKS_TOOL, GET_TASKS_BY_CATEGORY_TOOL],
+      tools:      [ADD_TASK_TOOL, UPDATE_TASK_TOOL, DELETE_TASK_TOOL, REVIEW_SCHEDULE_TOOL, ADD_CATEGORY_TOOL, GET_TASKS_BY_DATE_RANGE_TOOL, GET_UNSCHEDULED_TASKS_TOOL, GET_TASKS_BY_CATEGORY_TOOL, GET_ALL_TASKS_TOOL],
     }),
   });
 
@@ -420,6 +435,7 @@ export interface PlannerToolExecutors {
   executeGetTasksByDateRange: (input: GetTasksByDateRangeToolInput) => Promise<{ success: boolean; message: string }>;
   executeGetUnscheduledTasks: () => Promise<{ success: boolean; message: string }>;
   executeGetTasksByCategory: (input: GetTasksByCategoryToolInput) => Promise<{ success: boolean; message: string }>;
+  executeGetAllTasks: () => Promise<{ success: boolean; message: string }>;
 }
 
 export async function runPlannerTurn(
@@ -483,6 +499,9 @@ export async function runPlannerTurn(
       } else if (call.name === 'get_tasks_by_category') {
         const input = call.input as unknown as GetTasksByCategoryToolInput;
         const result = await executors.executeGetTasksByCategory(input);
+        toolResults.push({ type: 'tool_result', tool_use_id: call.id, content: result.message });
+      } else if (call.name === 'get_all_tasks') {
+        const result = await executors.executeGetAllTasks();
         toolResults.push({ type: 'tool_result', tool_use_id: call.id, content: result.message });
       } else {
         toolResults.push({ type: 'tool_result', tool_use_id: call.id, content: `Unknown tool: ${call.name}` });
