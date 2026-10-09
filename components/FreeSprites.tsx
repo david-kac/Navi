@@ -9,7 +9,7 @@ import { PixelSprite, GUITAR_GRID, DUMBBELL_GRID, BICYCLE_GRID, BOOK_GRID } from
 const OCARINA = require('../assets/ocarina.png');
 
 export const FREE_SPRITES: { id: string; render: () => React.ReactElement }[] = [
-  { id: 'ocarina',  render: () => <Image source={OCARINA} style={{ width: 52, height: 44.75 }} resizeMode="contain" fadeDuration={0} /> },
+  { id: 'ocarina',  render: () => <Image source={OCARINA} style={{ width: 41.6, height: 35.8 }} resizeMode="contain" fadeDuration={0} /> },
   { id: 'guitar',   render: () => <PixelSprite grid={GUITAR_GRID}   scale={3} /> },
   { id: 'dumbbell', render: () => <PixelSprite grid={DUMBBELL_GRID} scale={3} /> },
   { id: 'bicycle',  render: () => <PixelSprite grid={BICYCLE_GRID}  scale={3} /> },
@@ -17,6 +17,6 @@ export const FREE_SPRITES: { id: string; render: () => React.ReactElement }[] = 
 ];
 
 /** Same gap start time -> same icon, every render. */
-export function pickFreeSprite(startMin: number) {
-  return FREE_SPRITES[Math.floor(startMin / 5) % FREE_SPRITES.length];
+export function pickFreeSprite(_startMin: number) {
+  return FREE_SPRITES[0];
 }

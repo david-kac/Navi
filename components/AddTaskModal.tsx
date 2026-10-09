@@ -578,7 +578,7 @@ export default function AddTaskModal({ visible, onClose, onAdd, onSave, onAddMan
       <View style={s.backdrop} pointerEvents="none" />
 
       <KeyboardAvoidingView style={s.kav} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        <View style={s.sheet}>
+        <View style={[s.sheet, { maxHeight: winH * 0.8 }]}>
 
           {/* ── MAIN PANEL ── */}
           {panel === 'main' && (

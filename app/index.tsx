@@ -241,8 +241,8 @@ function DotHeader({ mood, onAdd, onOpenChat, onLongPressDot, activeView, onTogg
         <DotCharacter mood={mood} />
       </TouchableOpacity>
       <View style={s.dotBtns}>
-        <TouchableOpacity style={[s.timerBtn, timerActive && s.timerBtnOn]} onPress={onPressTimer} activeOpacity={0.7}>
-          <Timer size={16} color={timerActive ? BG : INK} strokeWidth={1.5} />
+        <TouchableOpacity style={s.bannerBtn} onPress={onPressTimer} activeOpacity={0.7}>
+          <Timer size={26} color={timerActive ? GREEN : INK} strokeWidth={1.5} />
           {timerRunning && <Text style={s.timerDot}>●</Text>}
         </TouchableOpacity>
         <TouchableOpacity style={s.bannerBtn} onPress={onToggleBattle} activeOpacity={0.7}>
@@ -336,28 +336,38 @@ function SectionHeader({ title }: { title: string }) {
 function TaskCard({ task, icon, onToggle, onLongPress, onOpen }: { task: Task; icon: string; onToggle: (id: string) => void; onLongPress: (task: Task) => void; onOpen: (task: Task) => void }) {
   const sub = timeLabel(task.scheduledTime, task.durationMins);
   return (
-    <TouchableOpacity
-      style={[s.card, task.isCompleted && s.cardFaded]}
-      onPress={() => onOpen(task)}
-      onLongPress={() => onLongPress(task)}
-      delayLongPress={400}
-      activeOpacity={0.85}
-    >
-      <View style={s.cardIconWrap}><NamedIcon name={icon} size={14} color={INK} /></View>
-      <TouchableOpacity onPress={() => onToggle(task.id)} style={s.checkHit}>
-        <View style={[s.checkbox, task.isCompleted && s.checkboxOn]}>
-          {task.isCompleted && <Text style={s.checkmark}>✓</Text>}
+    <View style={[s.card, task.isCompleted && s.cardFaded]}>
+      <TouchableOpacity
+        style={s.cardLeft}
+        onPress={() => onToggle(task.id)}
+        onLongPress={() => onLongPress(task)}
+        delayLongPress={400}
+        activeOpacity={0.85}
+      >
+        <View style={s.cardIconWrap}><NamedIcon name={icon} size={14} color={INK} /></View>
+        <View style={s.checkHit}>
+          <View style={[s.checkbox, task.isCompleted && s.checkboxOn]}>
+            {task.isCompleted && <Text style={s.checkmark}>✓</Text>}
+          </View>
         </View>
       </TouchableOpacity>
-      <View style={s.cardContent}>
-        <View style={s.titleRow}>
-          <Text style={[s.cardTitle, s.titleFlex, task.isCompleted && s.cardTitleDone]} numberOfLines={1}>{task.title}</Text>
-          {task.details ? <Book size={12} color={MUTED} strokeWidth={1.5} /> : null}
+      <TouchableOpacity
+        style={s.cardRight}
+        onPress={() => onOpen(task)}
+        onLongPress={() => onLongPress(task)}
+        delayLongPress={400}
+        activeOpacity={0.85}
+      >
+        <View style={s.cardContent}>
+          <View style={s.titleRow}>
+            <Text style={[s.cardTitle, s.titleFlex, task.isCompleted && s.cardTitleDone]} numberOfLines={1}>{task.title}</Text>
+            {task.details ? <Book size={12} color={MUTED} strokeWidth={1.5} /> : null}
+          </View>
+          {sub ? <Text style={s.cardSub}>{sub}</Text> : null}
         </View>
-        {sub ? <Text style={s.cardSub}>{sub}</Text> : null}
-      </View>
-      {task.isRecurring && <Repeat size={12} color={MUTED} strokeWidth={1.5} />}
-    </TouchableOpacity>
+        {task.isRecurring && <Repeat size={12} color={MUTED} strokeWidth={1.5} />}
+      </TouchableOpacity>
+    </View>
   );
 }
 
@@ -1169,6 +1179,7 @@ export default function HomeScreen() {
   const openTimerPicker = useCallback(async () => {
     if (timer) { setDetailTaskId(timer.taskId); return; }
     if (!userId) return;
+    setShowTimerPicker(true);
     const week = weekDatesSunday(new Date());
     // Recurring instances are generated lazily per day; make sure the whole week exists first.
     for (const iso of week) await generateTasksForDate(userId, iso);
@@ -1176,9 +1187,8 @@ export default function HomeScreen() {
       .from('tasks').select('*').eq('user_id', userId)
       .gte('date', week[0]).lte('date', week[6]).eq('is_completed', false)
       .order('date', { ascending: true }).order('scheduled_time', { ascending: true });
-    if (error) { console.error(error); return; }
+    if (error) { console.error(error); setShowTimerPicker(false); return; }
     setPickerTasks((data ?? []).map(rowToTask));
-    setShowTimerPicker(true);
   }, [timer, userId]);
 
   const pickerOptions: TimerPickOption[] = useMemo(() => pickerTasks.map(t => ({
@@ -1411,7 +1421,9 @@ const s = StyleSheet.create({
   sectionRow:  { paddingHorizontal: MARGIN, paddingTop: 14, paddingBottom: 6 },
   sectionTxt:  { fontFamily: 'PressStart2P', fontSize: 7, color: MUTED, lineHeight: 11, letterSpacing: 2 },
 
-  card:         { flexDirection: 'row', alignItems: 'center', marginHorizontal: MARGIN, marginBottom: 6, paddingHorizontal: 12, paddingVertical: 10, borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, backgroundColor: BG, gap: 10 },
+  card:         { flexDirection: 'row', alignItems: 'center', marginHorizontal: MARGIN, marginBottom: 6, borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, backgroundColor: BG },
+  cardLeft:     { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10, paddingLeft: 12, paddingVertical: 10 },
+  cardRight:    { flex: 3, flexDirection: 'row', alignItems: 'center', gap: 10, paddingRight: 12, paddingVertical: 10 },
   cardFaded:    { opacity: 0.5 },
   cardIconWrap: { width: 14, alignItems: 'center', justifyContent: 'center' },
   checkHit:     { padding: 1 },
@@ -1426,7 +1438,7 @@ const s = StyleSheet.create({
 
   timerBtn:     { width: 36, height: 36, borderWidth: BORDER, borderColor: INK, borderRadius: RADIUS, alignItems: 'center', justifyContent: 'center', backgroundColor: BG },
   timerBtnOn:   { backgroundColor: INK },
-  timerDot:     { position: 'absolute', top: 1, right: 3, fontFamily: 'PressStart2P', fontSize: 6, color: GREEN, lineHeight: 8 },
+  timerDot:     { position: 'absolute', top: 2, right: 2, fontFamily: 'PressStart2P', fontSize: 6, color: GREEN, lineHeight: 8 },
 
   freeToggleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', gap: 8, paddingHorizontal: MARGIN, paddingBottom: 4 },
   freeToggleBox: { width: 12, height: 12, borderWidth: BORDER, borderColor: INK, alignItems: 'center', justifyContent: 'center' },
